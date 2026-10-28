@@ -7,7 +7,8 @@ import numpy as np
 from alerts import AlertTimer
 from debug_tui import Dashboard
 from eye_detector import EyeAssessment
-from main import Monitor, demo_measurement, draw_debug_window, draw_overlay, preview_guidance
+from main import (Monitor, calibration_instruction, demo_measurement,
+                  draw_overlay, draw_side_overlay, preview_guidance)
 from posture_detector import PostureDetector
 
 
@@ -74,7 +75,7 @@ class DebugTests(unittest.TestCase):
         self.assertIn("Eye ratio", lines[18])
         self.assertIn("Blinks", lines[20])
 
-    def test_debug_window_has_measurements_and_camera_overlay_stays_simple(self):
+    def test_camera_overlay_stays_simple_and_side_feed_has_status(self):
         monitor = Monitor("front", 5)
         measured = demo_measurement(0, "front")
         snap = monitor.update(measured, 0, 20, {}, "demo", 0.30)
@@ -90,14 +91,48 @@ class DebugTests(unittest.TestCase):
             draw_overlay(cv2, frame, snap, monitor)
         self.assertIn("Posture:", " ".join(labels))
         self.assertNotIn("Torso angle", " ".join(labels))
+        self.assertIn("Details in terminal", " ".join(labels))
+        side = Monitor("side", 5)
+        side_snap = side.update(demo_measurement(0, "side"), 0, 20, {}, "phone")
         labels.clear()
         with patch.object(cv2, "putText", side_effect=record):
-            debug_frame = draw_debug_window(cv2, snap, monitor)
-        self.assertEqual(debug_frame.shape, (700, 1080, 3))
-        text = " ".join(labels)
-        for label in ("Torso angle", "Head tilt", "Elbow spread", "Face size",
-                      "Still:", "Left / right ratio", "Blink rate"):
-            self.assertIn(label, text)
+            draw_side_overlay(cv2, frame, side_snap)
+        self.assertIn("PHONE SIDE VIEW", " ".join(labels))
+
+    def test_calibration_guides_framing_and_waits_for_valid_pose(self):
+        from dataclasses import replace
+
+        monitor = Monitor("side", 5)
+        good = demo_measurement(0, "side")
+        far = replace(good, torso_scale=0.05)
+        near = replace(good, torso_scale=0.9)
+        self.assertIn("closer", calibration_instruction(far, "side"))
+        self.assertIn("back", calibration_instruction(near, "side"))
+        self.assertEqual(calibration_instruction(replace(good, torso_scale=0.5), "side"), "")
+        self.assertIn("right", calibration_instruction(replace(good, body_center=(0.1, 0.5)), "side"))
+        snap = monitor.update(far, 0, 20, {}, "phone")
+        self.assertEqual(snap.phase, "positioning")
+        self.assertIsNone(monitor.calibration_start)
+        monitor.update(good, 2, 20, {}, "phone")
+        moving = replace(good, body_center=(0.6, 0.5))
+        self.assertIn("Hold still", monitor.update(moving, 3, 20, {}, "phone").calibration_hint)
+        self.assertIsNone(monitor.calibration_start)
+        monitor.update(good, 4, 20, {}, "phone")
+        monitor.update(good, 9, 20, {}, "phone")
+        self.assertEqual(monitor.update(good, 9.1, 20, {}, "phone").assessment.status, "Good")
+
+    def test_side_dashboard_shows_independent_posture(self):
+        front = Monitor("front", 5)
+        side = Monitor("side", 5)
+        front_snap = front.update(demo_measurement(0, "front"), 0, 20, {}, "laptop")
+        side_snap = side.update(demo_measurement(0, "side"), 0, 20, {}, "phone")
+        dashboard = Dashboard.__new__(Dashboard)
+        dashboard.screen = FakeScreen(-1)
+        dashboard.screen.getmaxyx = lambda: (40, 110)
+        dashboard.colors_enabled = False
+        dashboard.draw(front_snap, front.detector, front.alert, side_snap, side.detector)
+        self.assertIn("PHONE SIDE VIEW", dashboard.screen.lines[31])
+        self.assertIn("Forward head", dashboard.screen.lines[36])
 
     def test_static_break_reminder_reaches_main_preview(self):
         monitor = Monitor("front", 5)

@@ -22,15 +22,16 @@ LEFT_HIP, RIGHT_HIP = 23, 24
 @dataclass(frozen=True)
 class Measurements:
     view: str
-    torso_angle: float  # degrees from image vertical, signed
+    torso_angle: float | None  # degrees from image vertical; absent without hips
     shoulder_angle: float  # degrees from image horizontal, signed
-    head_forward: float | None  # ear ahead of shoulder / torso length
+    head_forward: float | None  # side-view ear ahead of shoulder / neck height
     head_tilt: float | None = None  # ear-line angle from horizontal, front view
     head_turn: float | None = None  # nose offset from ear midpoint / ear gap
-    shoulder_clearance: float | None = None  # ear-to-shoulder gap / torso length
-    elbow_spread: float | None = None  # elbow-to-shoulder horizontal gap / torso length
+    shoulder_clearance: float | None = None  # ear-to-shoulder gap / shoulder width
+    elbow_spread: float | None = None  # elbow-to-shoulder horizontal gap / shoulder width
     face_width: float | None = None  # ear separation / image width
-    body_center: tuple[float, float] | None = None  # normalized torso center
+    body_center: tuple[float, float] | None = None  # normalized upper-body center
+    torso_scale: float | None = None  # head-to-shoulder height / image height
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,7 @@ class Assessment:
 class Thresholds:
     torso_degrees: float = 12.0
     shoulder_degrees: float = 8.0
-    head_forward_ratio: float = 0.18
+    head_forward_ratio: float = 0.30
     head_tilt_degrees: float = 10.0
     head_turn_ratio: float = 0.18
     shoulder_elevation_ratio: float = 0.12
@@ -84,18 +85,18 @@ class PostureDetector:
     def measure(
         self, landmarks: Sequence[object] | None, width: int, height: int
     ) -> Measurements | None:
-        if landmarks is None or len(landmarks) <= RIGHT_HIP or width <= 0 or height <= 0:
+        if landmarks is None or len(landmarks) <= RIGHT_SHOULDER or width <= 0 or height <= 0:
             return None
 
         def valid(index: int) -> bool:
-            return _visible(landmarks[index], self.visibility)
+            return index < len(landmarks) and _visible(landmarks[index], self.visibility)
 
         def point(index: int) -> np.ndarray:
             return _point(landmarks[index], width, height)
 
         sides = ((LEFT_SHOULDER, LEFT_HIP, LEFT_EAR), (RIGHT_SHOULDER, RIGHT_HIP, RIGHT_EAR))
-        available = [side for side in sides if valid(side[0]) and valid(side[1])]
-        if not available:
+        available = [side for side in sides if valid(side[0])]
+        if not available and self.view != "side":
             return None
 
         both = len(available) == 2
@@ -104,10 +105,8 @@ class PostureDetector:
         if self.view == "auto":
             if both:
                 shoulder_gap = np.linalg.norm(point(LEFT_SHOULDER) - point(RIGHT_SHOULDER))
-                torso_length = np.mean(
-                    [np.linalg.norm(point(s) - point(h)) for s, h, _ in sides]
-                )
-                mode = "front" if shoulder_gap / max(torso_length, 1.0) >= 0.55 else "side"
+                # Shoulder separation works even when a laptop camera cannot see hips.
+                mode = "front" if shoulder_gap / width >= 0.12 else "side"
             else:
                 mode = "side"
         else:
@@ -115,7 +114,8 @@ class PostureDetector:
 
         if mode == "front":
             shoulder = (point(LEFT_SHOULDER) + point(RIGHT_SHOULDER)) / 2
-            hip = (point(LEFT_HIP) + point(RIGHT_HIP)) / 2
+            hip = ((point(LEFT_HIP) + point(RIGHT_HIP)) / 2
+                   if valid(LEFT_HIP) and valid(RIGHT_HIP) else None)
             shoulder_line = point(RIGHT_SHOULDER) - point(LEFT_SHOULDER)
             if abs(shoulder_line[0]) < 5:
                 return None
@@ -123,9 +123,16 @@ class PostureDetector:
             # Handle mirrored / reversed shoulder ordering equivalently.
             shoulder_angle = ((shoulder_angle + 90) % 180) - 90
             head_forward = None
-            torso_length = np.linalg.norm(shoulder - hip)
-            body_center = ((shoulder[0] + hip[0]) / (2 * width),
-                           (shoulder[1] + hip[1]) / (2 * height))
+            shoulder_width = np.linalg.norm(shoulder_line)
+            visible_ears = [point(e) for e in (LEFT_EAR, RIGHT_EAR) if valid(e)]
+            if not visible_ears:
+                return None
+            ear_center = np.mean(visible_ears, axis=0)
+            neck_height = abs(shoulder[1] - ear_center[1])
+            if neck_height < 15:
+                return None
+            body_center = ((shoulder[0] + ear_center[0]) / (2 * width),
+                           (shoulder[1] + ear_center[1]) / (2 * height))
             head_tilt = head_turn = shoulder_clearance = elbow_spread = face_width = None
             if valid(LEFT_EAR) and valid(RIGHT_EAR):
                 ears = point(RIGHT_EAR) - point(LEFT_EAR)
@@ -137,48 +144,56 @@ class PostureDetector:
                         nose_offset = point(NOSE)[0] - (point(LEFT_EAR)[0] + point(RIGHT_EAR)[0]) / 2
                         head_turn = nose_offset / abs(ears[0])
                 shoulder_clearance = np.mean([
-                    (point(s)[1] - point(e)[1]) / max(torso_length, 1.0)
+                    (point(s)[1] - point(e)[1]) / max(shoulder_width, 1.0)
                     for s, e in ((LEFT_SHOULDER, LEFT_EAR), (RIGHT_SHOULDER, RIGHT_EAR))
                 ])
             if valid(LEFT_ELBOW) and valid(RIGHT_ELBOW):
                 elbow_spread = np.mean([
-                    abs(point(e)[0] - point(s)[0]) / max(torso_length, 1.0)
+                    abs(point(e)[0] - point(s)[0]) / max(shoulder_width, 1.0)
                     for s, e in ((LEFT_SHOULDER, LEFT_ELBOW),
                                  (RIGHT_SHOULDER, RIGHT_ELBOW))
                 ])
         else:
-            # Prefer the side whose shoulder and hip have the highest visibility.
-            s, h, e = max(
-                available,
-                key=lambda side: min(
-                    float(getattr(landmarks[side[0]], "visibility", 1.0)),
-                    float(getattr(landmarks[side[1]], "visibility", 1.0)),
-                ),
-            )
-            shoulder, hip = point(s), point(h)
+            # The phone only needs the ear, nose, and shoulder. Hips add a
+            # torso-lean check when visible, but never block head tracking.
+            candidates = [side for side in sides if valid(side[0]) and valid(side[2])]
+            if not candidates:
+                return None
+            s, h, e = max(candidates, key=lambda side: (
+                float(getattr(landmarks[side[0]], "visibility", 1.0)) +
+                float(getattr(landmarks[side[2]], "visibility", 1.0))
+            ))
+            shoulder, ear = point(s), point(e)
+            neck_height = abs(shoulder[1] - ear[1])
+            if neck_height < 15:
+                return None
+            hip = point(h) if valid(h) else None
             shoulder_angle = 0.0
             head_forward = None
             head_tilt = head_turn = shoulder_clearance = elbow_spread = face_width = None
-            body_center = ((shoulder[0] + hip[0]) / (2 * width),
-                           (shoulder[1] + hip[1]) / (2 * height))
-            if valid(e) and valid(NOSE):
+            body_center = ((shoulder[0] + ear[0]) / (2 * width),
+                           (shoulder[1] + ear[1]) / (2 * height))
+            if valid(NOSE):
                 # Nose determines which image direction is forward. If ambiguous,
                 # skip the head metric instead of guessing.
                 forward = point(NOSE)[0] - shoulder[0]
-                if abs(forward) >= 0.08 * np.linalg.norm(shoulder - hip):
+                if abs(forward) >= 0.08 * neck_height:
                     sign = math.copysign(1, forward)
-                    head_forward = sign * (point(e)[0] - shoulder[0]) / max(
-                        np.linalg.norm(shoulder - hip), 1.0
-                    )
+                    head_forward = sign * (ear[0] - shoulder[0]) / neck_height
 
-        torso = shoulder - hip
-        length = np.linalg.norm(torso)
-        if length < 35 or hip[1] - shoulder[1] < 20:
-            return None
-        torso_angle = math.degrees(math.atan2(torso[0], -torso[1]))
+        if hip is not None:
+            torso = shoulder - hip
+            length = np.linalg.norm(torso)
+            if length < 35 or hip[1] - shoulder[1] < 20:
+                hip = None
+        if hip is not None:
+            torso_angle = math.degrees(math.atan2(torso[0], -torso[1]))
+        else:
+            torso_angle = None
+        framing_scale = neck_height / height
         return Measurements(mode, torso_angle, shoulder_angle, head_forward,
                             head_tilt, head_turn, shoulder_clearance,
-                            elbow_spread, face_width, body_center)
+                            elbow_spread, face_width, body_center, framing_scale)
 
     def calibrate(self, samples: Sequence[Measurements]) -> bool:
         if not samples:
@@ -195,7 +210,7 @@ class PostureDetector:
         centers = [s.body_center for s in samples if s.body_center is not None]
         self.baseline = Measurements(
             mode,
-            statistics.median(s.torso_angle for s in samples),
+            median_optional("torso_angle"),
             statistics.median(s.shoulder_angle for s in samples),
             statistics.median(heads) if heads else None,
             median_optional("head_tilt"),
@@ -205,6 +220,7 @@ class PostureDetector:
             median_optional("face_width"),
             (statistics.median(c[0] for c in centers),
              statistics.median(c[1] for c in centers)) if centers else None,
+            median_optional("torso_scale"),
         )
         return True
 
@@ -214,9 +230,9 @@ class PostureDetector:
             return Assessment("Not Detected", None)
 
         t = self.thresholds
-        deviations = {
-            "Torso lean": abs(current.torso_angle - baseline.torso_angle) / t.torso_degrees
-        }
+        deviations = {}
+        if current.torso_angle is not None and baseline.torso_angle is not None:
+            deviations["Torso lean"] = abs(current.torso_angle - baseline.torso_angle) / t.torso_degrees
         if current.view == "front":
             deviations["Shoulder tilt"] = (
                 abs(current.shoulder_angle - baseline.shoulder_angle) / t.shoulder_degrees
@@ -242,6 +258,8 @@ class PostureDetector:
                 0.0, current.head_forward - baseline.head_forward
             ) / t.head_forward_ratio
 
+        if not deviations:
+            return Assessment("Not Detected", None)
         reasons = tuple(name for name, ratio in deviations.items() if ratio >= 1.0)
         # A simple relative score; 100 is the calibrated pose and 0 is a large deviation.
         score = int(round(max(0.0, 100.0 - 50.0 * max(deviations.values()))))

@@ -24,6 +24,7 @@ class DebugSnapshot:
     source: str
     eye: EyeAssessment = EyeAssessment("Not Detected")
     activity: ActivityAssessment = ActivityAssessment()
+    calibration_hint: str = ""
 
 
 class Dashboard:
@@ -58,12 +59,15 @@ class Dashboard:
             return "recalibrate"
         return None
 
-    def draw(self, snap: DebugSnapshot, detector: PostureDetector, alert: AlertTimer) -> None:
+    def draw(self, snap: DebugSnapshot, detector: PostureDetector, alert: AlertTimer,
+             side_snap: DebugSnapshot | None = None,
+             side_detector: PostureDetector | None = None) -> None:
         screen = self.screen
         screen.erase()
         height, width = screen.getmaxyx()
-        if height < 31 or width < 80:
-            self._line(0, "Resize terminal to at least 80 x 31")
+        needed = 39 if side_snap is not None else 31
+        if height < needed or width < 80:
+            self._line(0, f"Resize terminal to at least 80 x {needed}")
             screen.refresh()
             return
 
@@ -79,11 +83,13 @@ class Dashboard:
                    curses.color_pair(posture_color) if self.colors_enabled else 0)
         self._line(3, f"Indicators: {', '.join(snap.assessment.reasons) or '--'}")
         self._line(4, f"Warning {'ACTIVE' if snap.warning else 'off'}   Poor {snap.poor_seconds:.1f}/{alert.delay_seconds:.1f}s   Calibrate {snap.calibration_remaining:.1f}s")
+        if snap.calibration_hint:
+            self._line(15, f"Calibration: {snap.calibration_hint}")
         self._line(5, "POSE INDICATOR           Current    Baseline      Delta      Limit", curses.A_BOLD)
         metrics = (
             ("Torso angle (deg)", "torso_angle", t.torso_degrees, 1),
             ("Shoulder tilt (deg)", "shoulder_angle", t.shoulder_degrees, 1),
-            ("Forward head (torso)", "head_forward", t.head_forward_ratio, 2),
+            ("Forward head (neck)", "head_forward", t.head_forward_ratio, 2),
             ("Head tilt (deg)", "head_tilt", t.head_tilt_degrees, 1),
             ("Head turn (face)", "head_turn", t.head_turn_ratio, 2),
             ("Shoulder gap (torso)", "shoulder_clearance", t.shoulder_elevation_ratio, 2),
@@ -117,6 +123,16 @@ class Dashboard:
         self._line(26, "   ".join(bits[3:6]))
         self._line(27, "   ".join(bits[6:]))
         self._line(29, "Face size is relative to calibration; a webcam cannot measure screen distance.")
+        if side_snap is not None and side_detector is not None:
+            side = side_snap.measured
+            base = side_detector.baseline
+            self._line(31, "PHONE SIDE VIEW", curses.A_BOLD)
+            self._line(32, f"{side_snap.source}   {side_snap.phase}   Posture {side_snap.assessment.status}   Score {side_snap.assessment.score if side_snap.assessment.score is not None else '--'}")
+            self._line(33, f"Indicators: {', '.join(side_snap.assessment.reasons) or '--'}")
+            self._line(34, f"Warning {'ACTIVE' if side_snap.warning else 'off'}   Poor {side_snap.poor_seconds:.1f}s   Calibration {side_snap.calibration_remaining:.1f}s")
+            self._line(35, f"Torso angle: {shown(side.torso_angle if side else None, 1)}   Baseline: {shown(base.torso_angle if base else None, 1)}")
+            self._line(36, f"Forward head: {shown(side.head_forward if side else None)}   Baseline: {shown(base.head_forward if base else None)}")
+            self._line(37, f"Calibration: {side_snap.calibration_hint or 'Ready'}")
         screen.refresh()
 
     def _line(self, row: int, value: str, attr: int = 0) -> None:

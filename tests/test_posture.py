@@ -19,6 +19,27 @@ def landmarks():
 
 
 class PostureTests(unittest.TestCase):
+    def test_laptop_front_view_calibrates_without_hips(self):
+        from main import Monitor
+
+        points = landmarks()
+        for index in (23, 24):
+            points[index].visibility = 0.1
+        detector = PostureDetector(view="auto")
+        measured = detector.measure(points, 640, 480)
+        self.assertEqual(measured.view, "front")
+        self.assertIsNone(measured.torso_angle)
+        monitor = Monitor("auto", 5)
+        self.assertEqual(monitor.update(measured, 0, 20, {}, "laptop").phase, "calibrating")
+        monitor.update(measured, 5, 20, {}, "laptop")
+        self.assertEqual(monitor.update(measured, 5.1, 20, {}, "laptop").assessment.status, "Good")
+        points[12].y += 0.08
+        changed = monitor.detector.measure(points, 640, 480)
+        self.assertIn("Shoulder tilt", monitor.detector.assess(changed).reasons)
+        points[12].y -= 0.08
+        points[23].visibility = points[24].visibility = 0.9
+        self.assertEqual(monitor.detector.assess(monitor.detector.measure(points, 640, 480)).status, "Good")
+
     def test_front_lean_and_shoulder_tilt(self):
         detector = PostureDetector(view="front")
         points = landmarks()
@@ -47,6 +68,28 @@ class PostureTests(unittest.TestCase):
         self.assertIn("Forward head", assessment.reasons)
         points[11].visibility = 0.1
         self.assertEqual(detector.assess(detector.measure(points, 640, 480)).status, "Not Detected")
+
+    def test_side_phone_tracks_head_without_hips(self):
+        detector = PostureDetector(view="side")
+        points = landmarks()
+        for index in (23, 24, 8, 12):
+            points[index].visibility = 0.1
+        points[0].x, points[7].x, points[11].x = 0.65, 0.58, 0.5
+        baseline = detector.measure(points, 640, 480)
+        self.assertIsNotNone(baseline)
+        self.assertIsNone(baseline.torso_angle)
+        self.assertIsNotNone(baseline.head_forward)
+        from main import Monitor
+        monitor = Monitor("side", 5)
+        self.assertEqual(monitor.update(baseline, 0, 20, {}, "phone").phase, "calibrating")
+        monitor.update(baseline, 5, 20, {}, "phone")
+        self.assertEqual(monitor.update(baseline, 5.1, 20, {}, "phone").assessment.status, "Good")
+        detector.calibrate([baseline])
+        self.assertEqual(detector.assess(baseline).status, "Good")
+        points[7].x += 0.1
+        assessment = detector.assess(detector.measure(points, 640, 480))
+        self.assertEqual(assessment.status, "Poor")
+        self.assertEqual(assessment.reasons, ("Forward head",))
 
     def test_neck_shoulder_arm_and_relative_face_size(self):
         detector = PostureDetector(view="front")

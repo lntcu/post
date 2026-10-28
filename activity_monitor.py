@@ -41,7 +41,8 @@ class ActivityMonitor:
         else:
             anchor = self.anchor
             moved = math.dist(anchor.body_center, measured.body_center) >= self.movement_ratio
-            moved |= abs(anchor.torso_angle - measured.torso_angle) >= 8.0
+            if anchor.torso_angle is not None and measured.torso_angle is not None:
+                moved |= abs(anchor.torso_angle - measured.torso_angle) >= 8.0
             if anchor.head_tilt is not None and measured.head_tilt is not None:
                 moved |= abs(anchor.head_tilt - measured.head_tilt) >= 10.0
             if anchor.head_forward is not None and measured.head_forward is not None:

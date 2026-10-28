@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 
@@ -10,27 +11,45 @@ from alerts import AlertTimer
 from activity_monitor import ActivityMonitor
 from eye_detector import EyeMonitor, measure_eyes
 from posture_detector import Assessment, Measurements, PostureDetector
+from settings import load_settings, save_settings
 
 CALIBRATION_SECONDS = 5.0
 WINDOW_NAME = "Posture + Eye Monitor"
-DEBUG_WINDOW_NAME = "Measurements and Debug"
+SIDE_WINDOW_NAME = "Phone side view"
 
 
 def parse_args() -> argparse.Namespace:
+    saved = load_settings()
     parser = argparse.ArgumentParser(description="Local webcam posture and eye monitor")
-    parser.add_argument("--camera", type=int, default=0, help="OpenCV camera index (default: 0)")
-    parser.add_argument("--view", choices=("auto", "front", "side"), default="auto")
-    parser.add_argument("--alert-seconds", type=float, default=5.0)
+    parser.add_argument("--port", type=int, default=8765, help="Local web dashboard port")
+    parser.add_argument("--no-browser", action="store_true", help="Do not open a browser automatically")
+    parser.add_argument("--legacy-gui", action="store_true", help="Use the previous OpenCV controls")
+    parser.add_argument("--camera", type=int, default=saved["camera"], help="OpenCV camera index")
+    side = parser.add_mutually_exclusive_group()
+    side.add_argument("--side-camera", type=int, help="Phone exposed as a USB/Continuity webcam camera index")
+    side.add_argument("--side-url", help="Phone camera MJPEG/RTSP stream URL on the local network")
+    parser.add_argument("--view", choices=("auto", "front", "side"), default=saved["view"])
+    parser.add_argument("--alert-seconds", type=float, default=saved["alert_seconds"])
     parser.add_argument("--sound", action="store_true", help="Windows beep when warning starts")
+    parser.add_argument("--no-notifications", action="store_true",
+                        help="Disable macOS posture, eye, activity, and camera notifications")
     parser.add_argument("--tui", action="store_true", help="Live terminal measurements")
-    parser.add_argument("--demo", action="store_true", help="Camera-free simulation; requires --tui")
+    parser.add_argument("--no-gui", action="store_true", help="Run with camera preview only")
+    parser.add_argument("--demo", action="store_true", help="Camera-free simulation in the dashboard or terminal")
     args = parser.parse_args()
-    if args.alert_seconds <= 0:
+    if not math.isfinite(args.alert_seconds) or args.alert_seconds <= 0:
         parser.error("--alert-seconds must be positive")
-    if args.demo and not args.tui:
-        parser.error("--demo requires --tui")
+    if args.side_camera is not None and args.side_camera == args.camera:
+        parser.error("--side-camera must differ from --camera")
+    if args.side_url and not args.side_url.startswith(("http://", "https://", "rtsp://")):
+        parser.error("--side-url must be an http(s) or rtsp stream URL")
+    if not 0 <= args.port <= 65535:
+        parser.error("--port must be 0–65535")
+    if args.demo and (args.legacy_gui or args.no_gui):
+        parser.error("--demo uses the web dashboard or --tui")
     if args.tui and not (sys.stdin.isatty() and sys.stdout.isatty()):
         parser.error("--tui requires an interactive terminal")
+    args.notifications = saved["notifications"] and not args.no_notifications
     return args
 
 
@@ -72,9 +91,18 @@ class Monitor:
         eye = self.eyes.update(openness, now)
         activity = self.activity.update(measured, now)
 
+        hint = calibration_instruction(measured, self.detector.view)
         if self.detector.baseline is None:
             self.alert.reset()
-            if measured is None or (self.calibration_view and measured.view != self.calibration_view):
+            if not hint and self.samples and measured is not None:
+                first = self.samples[0]
+                moved = (measured.torso_angle is not None and first.torso_angle is not None
+                         and abs(measured.torso_angle - first.torso_angle) > 8.0)
+                if measured.body_center and first.body_center:
+                    moved |= math.dist(measured.body_center, first.body_center) > 0.05
+                if moved:
+                    hint = "Hold still in your comfortable upright position."
+            if hint or (self.calibration_view and measured.view != self.calibration_view):
                 self.samples.clear()
                 self.calibration_start = None
                 self.calibration_view = None
@@ -88,14 +116,42 @@ class Monitor:
                     self.samples.clear()
             remaining = (max(0.0, CALIBRATION_SECONDS - (now - self.calibration_start))
                          if self.calibration_start is not None else CALIBRATION_SECONDS)
-            return DebugSnapshot("calibrating" if measured else "waiting for landmarks",
-                                 Assessment("Calibrating" if measured else "Not Detected", None),
+            return DebugSnapshot("calibrating" if not hint else "positioning",
+                                 Assessment("Calibrating" if not hint else "Not Detected", None),
                                  measured, remaining,
-                                 0.0, False, fps, landmarks, source, eye, activity)
+                                 0.0, False, fps, landmarks, source, eye, activity, hint)
         assessment = self.detector.assess(measured)
         warning, elapsed = self.alert.update(assessment.status, now)
         return DebugSnapshot("monitoring", assessment, measured, 0.0,
                              elapsed, warning, fps, landmarks, source, eye, activity)
+
+
+def calibration_instruction(measured: Measurements | None, view: str) -> str:
+    """Give framing feedback before accepting an upright baseline."""
+    if measured is None:
+        return ("Show your ear, nose, and shoulder side-on to the phone."
+                if view == "side" else "Show your face and both shoulders to the camera.")
+    if view == "side" and measured.head_forward is None:
+        return "Turn side-on so your ear and nose are visible."
+    if measured.torso_scale is not None:
+        minimum, maximum = (0.08, 0.62) if view == "side" else (0.07, 0.45)
+        if measured.torso_scale < minimum:
+            return ("Move the phone closer; your upper body is too small."
+                    if view == "side" else "Move closer so your head and shoulders are clear.")
+        if measured.torso_scale > maximum:
+            return ("Move the phone back slightly so your ear and shoulder fit."
+                    if view == "side" else "Move back slightly so your head and shoulders fit.")
+    if measured.body_center is not None:
+        x, y = measured.body_center
+        if x < 0.28:
+            return "Move toward the right side of the picture."
+        if x > 0.72:
+            return "Move toward the left side of the picture."
+        if y < (0.15 if view == "side" else 0.12):
+            return "Lower the camera or sit slightly farther back."
+        if y > (0.85 if view == "side" else 0.78):
+            return "Raise the camera or sit slightly farther back."
+    return ""
 
 
 def draw_overlay(cv2, frame, snap, monitor: Monitor) -> None:
@@ -117,13 +173,13 @@ def draw_overlay(cv2, frame, snap, monitor: Monitor) -> None:
     score = snap.assessment.score
     posture = snap.assessment.status
     line(f"Posture: {posture}{f' ({score})' if score is not None else ''}   |   Eyes: {snap.eye.status}", 27)
-    line(f"Nearly still: {snap.activity.still_seconds / 60:.1f} min   |   Measurements in Debug window",
+    line(f"Nearly still: {snap.activity.still_seconds / 60:.1f} min   |   Details in terminal with --tui",
          51, (185, 190, 195), 0.47)
     guidance = preview_guidance(snap)
     for index, (message, urgent) in enumerate(guidance[:3]):
         line(message, 79 + index * 26, (70, 100, 255) if urgent else (0, 210, 255), 0.52)
     if len(guidance) > 3:
-        line(f"+{len(guidance) - 3} more issue(s) in Debug window", 157,
+        line(f"+{len(guidance) - 3} more issue(s) in terminal dashboard", 157,
              (185, 190, 195), 0.44)
     line("Q quit  |  R recalibrate  |  V switch view", height - 13, (235, 235, 235), 0.47)
 
@@ -147,13 +203,16 @@ EYE_GUIDANCE = {
 
 
 def preview_guidance(snap) -> list[tuple[str, bool]]:
-    """Prioritize distinct issues; the debug window contains every reason."""
+    """Prioritize distinct issues for the preview."""
     if snap.phase != "monitoring":
+        if snap.calibration_hint:
+            return [(snap.calibration_hint, False),
+                    ("Hold a comfortable upright position once framed.", False)]
         if snap.measured is None:
-            return [("Pose not tracked: show your shoulders and hips.", False),
+            return [("Pose not tracked: show your face and shoulders.", False),
                     ("Keep your face visible for eye measurements.", False)]
         return [(f"Calibrating: sit comfortably upright for {snap.calibration_remaining:.1f}s.", False),
-                ("Keep your face, shoulders, and hips in view.", False)]
+                ("Keep your face and shoulders in view.", False)]
 
     activity = ([('Long stillness: change position or take a short break.', True)]
                 if snap.activity.warning else [])
@@ -162,140 +221,171 @@ def preview_guidance(snap) -> list[tuple[str, bool]]:
     eyes = [(EYE_GUIDANCE.get(reason, reason), True)
             for reason in snap.eye.reasons]
     if snap.assessment.status == "Not Detected":
-        posture.append(("Pose not tracked: show your shoulders and hips.", False))
+        posture.append(("Pose not tracked: show your face and shoulders.", False))
     if snap.eye.status == "Not Detected":
         eyes.append(("Eyes not tracked: face the camera in good light.", False))
     guidance = activity + posture[:1] + eyes[:1] + posture[1:] + eyes[1:]
     return guidance or [("Measurements in range: stay comfortable and move often.", False)]
 
 
-def draw_debug_window(cv2, snap, monitor: Monitor):
-    """Render detailed CV measurements in a separate OpenCV window."""
-    import numpy as np
-
-    canvas = np.full((700, 1080, 3), (30, 32, 36), dtype=np.uint8)
-    white, muted, green, amber, red = ((245, 245, 245), (185, 190, 195),
-                                       (80, 210, 100), (0, 210, 255), (60, 80, 255))
-
-    def put(text: str, x: int, y: int, color=white, scale=0.56) -> None:
-        cv2.putText(canvas, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    scale, color, 1, cv2.LINE_AA)
-
-    def fmt(number, digits=2):
-        return f"{number:.{digits}f}" if number is not None else "--"
-
-    def metric(label, current, baseline, limit, y, digits=2):
-        change = current - baseline if current is not None and baseline is not None else None
-        put(f"{label:<17} {fmt(current, digits):>7}  {fmt(baseline, digits):>7}  {fmt(change, digits):>7}  {limit}", 20, y)
-
-    measured, base = snap.measured, monitor.detector.baseline
-    thresholds = monitor.detector.thresholds
-    put("POSTURE + EYE MONITOR  /  LIVE MEASUREMENTS", 20, 32, white, 0.72)
-    put(f"{snap.source}    {snap.fps:.1f} FPS    view: {monitor.detector.view}    phase: {snap.phase}", 20, 62, muted)
-    cv2.line(canvas, (20, 77), (1060, 77), (90, 95, 100), 1)
-    posture_color = red if snap.warning else green if snap.assessment.status == "Good" else amber
-    eye_color = red if snap.eye.warning else green if snap.eye.status == "Tracking" else amber
-    put(f"POSTURE  {snap.assessment.status}  score {snap.assessment.score if snap.assessment.score is not None else '--'}", 20, 107, posture_color, 0.65)
-    put(f"EYES  {snap.eye.status}", 565, 107, eye_color, 0.65)
-    put("Indicator             Now     Base    Delta    Limit", 20, 140, muted, 0.49)
-    metric("Torso angle", measured.torso_angle if measured else None,
-           base.torso_angle if base else None, f"{thresholds.torso_degrees:.0f} deg", 170, 1)
-    metric("Shoulder tilt", measured.shoulder_angle if measured and measured.view == "front" else None,
-           base.shoulder_angle if base and base.view == "front" else None,
-           f"{thresholds.shoulder_degrees:.0f} deg", 200, 1)
-    metric("Forward head", measured.head_forward if measured else None,
-           base.head_forward if base else None, f"{thresholds.head_forward_ratio:.2f}", 230)
-    metric("Head tilt", measured.head_tilt if measured else None,
-           base.head_tilt if base else None, f"{thresholds.head_tilt_degrees:.0f} deg", 260, 1)
-    metric("Head turn", measured.head_turn if measured else None,
-           base.head_turn if base else None, f"{thresholds.head_turn_ratio:.2f}", 290)
-    metric("Shoulder gap", measured.shoulder_clearance if measured else None,
-           base.shoulder_clearance if base else None,
-           f"{thresholds.shoulder_elevation_ratio:.2f}", 320)
-    metric("Elbow spread", measured.elbow_spread if measured else None,
-           base.elbow_spread if base else None, f"{thresholds.elbow_spread_ratio:.2f}", 350)
-    face_scale = (measured.face_width / base.face_width
-                  if measured and base and measured.face_width is not None and base.face_width else None)
-    put(f"Face size / baseline: {fmt(face_scale)}   alert at {thresholds.face_scale_ratio:.2f}", 20, 390)
-    put("Closer to camera is a relative cue, not screen distance.", 20, 420, muted, 0.46)
-    put(f"Still: {snap.activity.still_seconds / 60:.1f} min   reminder: {monitor.activity.reminder_seconds / 60:.0f} min", 20, 460,
-        red if snap.activity.warning else white)
-    put("Posture indicators:", 20, 505, muted)
-    from textwrap import wrap
-    for index, reason in enumerate(wrap(", ".join(snap.assessment.reasons), width=42)[:4]):
-        put(reason, 20, 533 + index * 25, amber)
-    if snap.activity.warning:
-        put("Change position / take a short break", 20, 610, red)
-
-    eye = snap.eye
-    put(f"Left / right ratio: {fmt(eye.left_ratio, 3)} / {fmt(eye.right_ratio, 3)}", 565, 155)
-    put(f"Mean openness: {fmt(eye.openness, 3)}", 565, 185)
-    put(f"Open reference: {fmt(eye.open_baseline, 3)}", 565, 215)
-    put(f"Closed cutoff: {fmt(eye.closed_threshold, 3)}", 565, 245)
-    put(f"Blinks (rolling 60s): {eye.blink_count}", 565, 285)
-    put(f"Blink rate: {fmt(eye.blinks_per_minute, 1)} / min", 565, 315)
-    put(f"Closed now: {eye.closed_seconds:.1f} s", 565, 345)
-    fraction = eye.closed_fraction * 100 if eye.closed_fraction is not None else None
-    put(f"Closed fraction (30s): {fmt(fraction, 0)}%", 565, 375)
-    put(f"Since last blink: {eye.since_blink:.1f} s", 565, 405)
-    put("Eye indicators:", 565, 455, muted)
-    for index, reason in enumerate(eye.reasons[:4]):
-        put(reason, 565, 483 + index * 25, amber)
-    if eye.warning:
-        put(eye.warning, 565, 600, red)
-    elif eye.status == "Not Detected":
-        put("Show at least one eye to camera", 565, 600, amber)
-
-    cv2.line(canvas, (20, 636), (1060, 636), (90, 95, 100), 1)
-    visible = [f"{name} {fmt(value, 2)}" for name, value in snap.landmarks.items()]
-    put("Pose visibility: " + "   ".join(visible[:4]), 20, 659, muted, 0.47)
-    put("   ".join(visible[4:]), 20, 682, muted, 0.47)
-    return canvas
-
-
-def handle_action(action: str | None, monitor: Monitor) -> bool:
+def handle_action(action: str | None, monitor: Monitor,
+                  side_monitor: Monitor | None = None) -> bool:
     if action == "quit":
         return True
     if action == "recalibrate":
         monitor.reset()
+        if side_monitor is not None:
+            side_monitor.reset()
     return False
+
+
+def draw_side_overlay(cv2, frame, snap) -> None:
+    """Show the phone image and its independent posture result."""
+    height, width = frame.shape[:2]
+    panel = frame.copy()
+    cv2.rectangle(panel, (0, 0), (width, 145), (20, 20, 20), -1)
+    cv2.rectangle(panel, (0, height - 35), (width, height), (20, 20, 20), -1)
+    cv2.addWeighted(panel, 0.7, frame, 0.3, 0, frame)
+
+    def line(message, y, color=(245, 245, 245)):
+        while message and cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)[0][0] > width - 28:
+            message = message[:-1]
+        cv2.putText(frame, message, (14, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52, color, 1, cv2.LINE_AA)
+
+    line(f"PHONE SIDE VIEW | Posture: {snap.assessment.status} | Score: {snap.assessment.score if snap.assessment.score is not None else '--'}", 28)
+    if snap.source == "phone disconnected":
+        line("Phone disconnected. Check the cable or stream URL; retrying.", 60,
+             (0, 210, 255))
+    elif snap.phase != "monitoring":
+        line(snap.calibration_hint or f"Sit upright and hold still: {snap.calibration_remaining:.1f}s", 60, (0, 210, 255))
+        line("Place phone side-on; show ear, nose, and shoulder.", 88)
+    else:
+        reasons = snap.assessment.reasons
+        line(POSTURE_GUIDANCE.get(reasons[0], reasons[0]) if reasons else "Side posture in range.",
+             60, (70, 100, 255) if snap.warning else (0, 210, 255))
+        if snap.warning:
+            line("Correct your side posture.", 88, (70, 100, 255))
+    line("Q quit  |  R recalibrate both views", height - 12)
+
+
+def open_side_capture(cv2, source):
+    if isinstance(source, int):
+        capture = cv2.VideoCapture(source)
+        if capture.isOpened():
+            capture.set(cv2.CAP_PROP_ZOOM, 0)
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        return capture
+    # FFmpeg timeouts keep a lost network phone from freezing the laptop feed.
+    return cv2.VideoCapture(source, cv2.CAP_FFMPEG, [
+        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000,
+        cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000,
+    ])
 
 
 def run_camera(args: argparse.Namespace, dashboard=None) -> int:
     import cv2
     import mediapipe as mp
+    import numpy as np
+    from contextlib import ExitStack
     from debug_tui import landmark_visibility
-
+    controls = None
+    settings = {"camera": args.camera, "view": args.view,
+                "alert_seconds": args.alert_seconds, "notifications": args.notifications}
     capture = cv2.VideoCapture(args.camera)
     if not capture.isOpened():
         capture.release()
         raise RuntimeError(f"Could not open camera {args.camera}. Check permissions/index.")
-    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+    # Request a wide sensor mode, and reset hardware zoom where supported.
+    # Drivers may ignore either request; landmark framing guidance remains useful.
+    capture.set(cv2.CAP_PROP_ZOOM, 0)
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    if dashboard is None and not args.no_gui:
+        from controls import ControlWindow
+        controls = ControlWindow(settings)
+    side_source = args.side_camera if args.side_camera is not None else args.side_url
+    side_capture = None
+    side_monitor = Monitor("side", args.alert_seconds) if side_source is not None else None
+    side_snap = None
+    last_side_retry = 0.0
     monitor = Monitor(args.view, args.alert_seconds)
+    from notifications import MacNotifier
+    notifier = MacNotifier(enabled=args.notifications)
     missing_frames = 0
     previous_frame = None
     previous_warning = False
     last_dashboard_draw = 0.0
     pose_api = mp.solutions.pose
+    pose_options = dict(static_image_mode=False, model_complexity=1,
+                        smooth_landmarks=True, min_detection_confidence=0.6,
+                        min_tracking_confidence=0.6)
     try:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.namedWindow(DEBUG_WINDOW_NAME, cv2.WINDOW_NORMAL)
-        with pose_api.Pose(
-            static_image_mode=False,
-            # Full model ships with this wheel; Lite downloads at startup.
-            model_complexity=1,
-            smooth_landmarks=True,
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.6,
-        ) as pose, mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=False,
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.6,
-        ) as face_mesh:
+        if side_monitor:
+            cv2.namedWindow(SIDE_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        with ExitStack() as stack:
+            pose = stack.enter_context(pose_api.Pose(**pose_options))
+            face_mesh = stack.enter_context(mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=False, max_num_faces=1, refine_landmarks=False,
+                min_detection_confidence=0.6, min_tracking_confidence=0.6))
+            side_pose = stack.enter_context(pose_api.Pose(**pose_options)) if side_monitor else None
             while True:
+                if controls:
+                    action = controls.poll()
+                    if action == "quit":
+                        break
+                    if action == "pause":
+                        monitor.reset()
+                        if side_monitor:
+                            side_monitor.reset()
+                        notifier.active.clear()
+                    elif action == "resume" or action == "recalibrate":
+                        monitor.reset()
+                        if side_monitor:
+                            side_monitor.reset()
+                    elif action == "camera":
+                        next_camera = controls.camera
+                        candidate = cv2.VideoCapture(next_camera)
+                        if candidate.isOpened():
+                            capture.release()
+                            capture = candidate
+                            capture.set(cv2.CAP_PROP_ZOOM, 0)
+                            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                            settings["camera"] = next_camera
+                            save_settings(settings)
+                            monitor.reset()
+                        else:
+                            candidate.release()
+                            controls.camera = settings["camera"]
+                            controls.show_error(f"Could not open camera {next_camera}.")
+                    elif action == "view":
+                        monitor.detector.view = controls.view
+                        settings["view"] = controls.view
+                        save_settings(settings)
+                        monitor.reset()
+                    elif action == "delay":
+                        seconds = controls.delay
+                        monitor.alert.delay_seconds = seconds
+                        if side_monitor:
+                            side_monitor.alert.delay_seconds = seconds
+                        settings["alert_seconds"] = seconds
+                        save_settings(settings)
+                    elif action == "notifications":
+                        notifier.enabled = controls.notifications and sys.platform == "darwin"
+                        settings["notifications"] = controls.notifications
+                        save_settings(settings)
+                    elif action == "snooze":
+                        notifier.snooze(10 * 60)
+                        controls.detail = "System alerts snoozed for 10 minutes."
+                        controls.draw()
+                    if controls.paused:
+                        controls.show_status(None)
+                        cv2.waitKey(1)
+                        time.sleep(0.05)
+                        continue
                 ok, frame = capture.read()
                 if not ok:
                     missing_frames += 1
@@ -314,8 +404,7 @@ def run_camera(args: argparse.Namespace, dashboard=None) -> int:
                 height, width = frame.shape[:2]
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 rgb.flags.writeable = False
-                pose_rgb = (cv2.resize(rgb, (640, 480))
-                            if width > 640 or height > 480 else rgb)
+                pose_rgb = cv2.resize(rgb, (640, 480)) if width > 640 or height > 480 else rgb
                 pose_rgb.flags.writeable = False
                 result = pose.process(pose_rgb)
                 face_result = face_mesh.process(rgb)
@@ -331,32 +420,85 @@ def run_camera(args: argparse.Namespace, dashboard=None) -> int:
                 fps = 1.0 / (now - previous_frame) if previous_frame is not None and now > previous_frame else 0.0
                 previous_frame = now
                 snap = monitor.update(measured, now, fps, landmark_visibility(landmarks),
-                                      "webcam", openness)
-                active_warning = snap.warning or bool(snap.eye.warning) or snap.activity.warning
-                if active_warning and not previous_warning:
+                                      "laptop webcam", openness)
+
+                if side_monitor:
+                    if side_capture is None and now - last_side_retry >= 3.0:
+                        last_side_retry = now
+                        candidate = open_side_capture(cv2, side_source)
+                        if candidate.isOpened():
+                            side_capture = candidate
+                            side_capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            side_monitor.reset()
+                        else:
+                            candidate.release()
+                    side_ok, side_frame = side_capture.read() if side_capture is not None else (False, None)
+                    if side_ok:
+                        side_frame = cv2.flip(side_frame, 1)
+                        sh, sw = side_frame.shape[:2]
+                        side_rgb = cv2.cvtColor(side_frame, cv2.COLOR_BGR2RGB)
+                        side_rgb.flags.writeable = False
+                        side_small = cv2.resize(side_rgb, (640, 480)) if sw > 640 or sh > 480 else side_rgb
+                        side_small.flags.writeable = False
+                        side_result = side_pose.process(side_small)
+                        side_landmarks = side_result.pose_landmarks.landmark if side_result.pose_landmarks else None
+                        side_measured = side_monitor.detector.measure(side_landmarks, sw, sh)
+                        if side_result.pose_landmarks:
+                            mp.solutions.drawing_utils.draw_landmarks(
+                                side_frame, side_result.pose_landmarks, pose_api.POSE_CONNECTIONS)
+                        side_snap = side_monitor.update(side_measured, now, fps,
+                                                        landmark_visibility(side_landmarks), "phone side camera")
+                    else:
+                        if side_capture is not None:
+                            side_capture.release()
+                            side_capture = None
+                            side_monitor.reset()
+                            last_side_retry = now
+                        side_frame = np.zeros((720, 960, 3), dtype=np.uint8)
+                        side_snap = side_monitor.update(None, now, 0.0, {}, "phone disconnected")
+                    draw_side_overlay(cv2, side_frame, side_snap)
+                    cv2.imshow(SIDE_WINDOW_NAME, side_frame)
+
+                notifier.update(snap, side_snap, now)
+                active_warning = (snap.warning or bool(snap.eye.warning) or snap.activity.warning
+                                  or bool(side_snap and side_snap.warning))
+                if active_warning and not previous_warning and not notifier.is_snoozed(now):
                     maybe_beep(args.sound)
                 previous_warning = active_warning
+                if controls:
+                    controls.show_status(snap, side_snap)
                 draw_overlay(cv2, frame, snap, monitor)
                 cv2.imshow(WINDOW_NAME, frame)
-                cv2.imshow(DEBUG_WINDOW_NAME, draw_debug_window(cv2, snap, monitor))
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
                 if key == ord("r"):
                     monitor.reset()
+                    if side_monitor:
+                        side_monitor.reset()
                 if key == ord("v"):
                     choices = ("auto", "front", "side")
                     monitor.detector.view = choices[
                         (choices.index(monitor.detector.view) + 1) % len(choices)]
                     monitor.reset()
+                    if controls:
+                        controls.view = monitor.detector.view
+                        settings["view"] = monitor.detector.view
+                        save_settings(settings)
                 if dashboard is not None:
                     if now - last_dashboard_draw >= 0.1:
-                        dashboard.draw(snap, monitor.detector, monitor.alert)
+                        dashboard.draw(snap, monitor.detector, monitor.alert,
+                                       side_snap, side_monitor.detector if side_monitor else None)
                         last_dashboard_draw = now
-                    if handle_action(dashboard.input(monitor.detector, monitor.alert), monitor):
+                    if handle_action(dashboard.input(monitor.detector, monitor.alert),
+                                     monitor, side_monitor):
                         break
     finally:
         capture.release()
+        if side_capture is not None:
+            side_capture.release()
+        if controls:
+            controls.close()
         cv2.destroyAllWindows()
     return 0
 
@@ -421,8 +563,11 @@ def main() -> int:
                 return run_demo(args, dashboard) if args.demo else run_camera(args, dashboard)
 
             return curses.wrapper(run)
+        if not args.legacy_gui and not args.no_gui:
+            from web_server import run_web
+            return run_web(args)
         return run_camera(args)
-    except (RuntimeError, KeyboardInterrupt) as exc:
+    except (OSError, RuntimeError, KeyboardInterrupt) as exc:
         if str(exc):
             print(str(exc), file=sys.stderr)
         return 1
