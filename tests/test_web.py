@@ -24,6 +24,30 @@ def preferences():
 
 
 class WebTests(unittest.TestCase):
+    def test_tiredness_reminders_obey_preferences_and_tracking(self):
+        from fatigue_detector import BREAK_GUIDANCE
+        with patch('web_server.load_settings', return_value=preferences()):
+            dashboard = Dashboard(args())
+        dashboard.started = True
+        dashboard.cameras['front'] = {'fatigue': {'warning': True, 'guidance': BREAK_GUIDANCE}}
+        self.assertEqual(dashboard.state()['alerts'], [BREAK_GUIDANCE])
+        self.assertEqual(dashboard.state()['notifications'][0]['category'], 'Tiredness')
+        dashboard.settings['web']['fatigue_alerts'] = False
+        self.assertEqual(dashboard.state()['alerts'], [])
+        self.assertTrue(dashboard.state()['cameras']['front']['fatigue']['warning'])
+        dashboard.settings['web']['fatigue_alerts'] = True
+        dashboard.command({'action': 'snooze', 'minutes': 5})
+        self.assertEqual(dashboard.state()['alerts'], [])
+        dashboard.command({'action': 'unsnooze'})
+        with patch('web_server.quiet_now', return_value=True):
+            self.assertEqual(dashboard.state()['alerts'], [])
+        dashboard.cameras['front']['updated_at'] = time.monotonic() - 10
+        self.assertEqual(dashboard.state()['alerts'], [])
+        self.assertNotIn('fatigue', dashboard.state()['cameras']['front'])
+        with self.assertRaises(ValueError):
+            validate_preferences({'fatigue_alerts': 'yes'}, preferences())
+        self.assertFalse(validate_preferences({'fatigue_alerts': False}, preferences())['web']['fatigue_alerts'])
+
     def test_preferences_validate_atomically(self):
         original = preferences()
         for update in ({"camera": True}, {"camera": 1.5}, {"break_minutes": float('nan')},
@@ -37,10 +61,94 @@ class WebTests(unittest.TestCase):
         self.assertEqual(result['alert_seconds'], 12)
         self.assertEqual(result['web']['side_source'], '1')
 
+    def test_voice_and_writing_preferences_are_validated(self):
+        original = preferences()
+        for update in ({"spoken_alerts": "yes"}, {"speech_volume": 2}, {"speech_rate": .1},
+                       {"writing_hand": "either"}, {"writing_source": "00"},
+                       {"side_source": "1", "writing_source": "01"}, {"history_enabled": 1}):
+            with self.subTest(update=update), self.assertRaises(ValueError):
+                validate_preferences(update, original)
+        updated = validate_preferences({"writing_enabled": True, "writing_hand": "left",
+                                        "writing_source": "2", "spoken_alerts": True}, original)
+        self.assertEqual(updated['web']['writing_hand'], 'left')
+
+    def test_writing_reminders_obey_categories_and_snooze(self):
+        with patch('web_server.load_settings', return_value=preferences()):
+            dashboard = Dashboard(args())
+        dashboard.started = True
+        dashboard.settings['web']['writing_enabled'] = True
+        dashboard.writing = {'warning': True, 'guidance': ['Your grip geometry changed.']}
+        self.assertEqual(dashboard.state()['alerts'], ['Your grip geometry changed.'])
+        dashboard.settings['web']['writing_alerts'] = False
+        self.assertEqual(dashboard.state()['alerts'], [])
+        dashboard.settings['web']['writing_alerts'] = True
+        dashboard.command({'action': 'snooze', 'minutes': 5})
+        self.assertEqual(dashboard.state()['alerts'], [])
+
+    def test_severity_notifications_and_score_respect_missing_tracking_and_snooze(self):
+        with patch('web_server.load_settings', return_value=preferences()):
+            dashboard = Dashboard(args())
+        dashboard.started = True
+        dashboard.cameras['front'] = {'phase': 'monitoring', 'warning': True,
+            'guidance': ['Adjust torso'], 'metrics': [{'name': 'Torso lean', 'available': True,
+                'delta': 20, 'threshold': 10, 'issue': True, 'guidance': 'Adjust torso'}]}
+        state = dashboard.state()
+        self.assertEqual(state['coaching']['score'], 0)
+        self.assertEqual(state['notifications'][0]['severity'], 'attention')
+        self.assertEqual(state['notifications'][0]['score'], 0)
+        dashboard.command({'action': 'snooze', 'minutes': 5})
+        state = dashboard.state()
+        self.assertEqual(state['notifications'], [])
+        self.assertEqual(state['coaching']['score'], 0)
+        dashboard.cameras['front']['updated_at'] = time.monotonic() - 10
+        self.assertIsNone(dashboard.state()['coaching']['score'])
+
+    def test_break_pauses_cameras_and_snoozes_reminders(self):
+        with patch('web_server.load_settings', return_value=preferences()):
+            dashboard = Dashboard(args())
+        self.assertFalse(dashboard.started)
+        dashboard.command({'action': 'start'})
+        dashboard.command({'action': 'take_break'})
+        state = dashboard.state()
+        self.assertTrue(state['paused'])
+        self.assertGreater(state['break_seconds'], 115)
+        self.assertGreater(state['snooze_seconds'], 115)
+        with self.assertRaises(ValueError):
+            dashboard.command({'action': 'clear_history'})
+        dashboard.command({'action': 'stop'})
+        dashboard.command({'action': 'clear_history'})
+        self.assertIsNone(dashboard.analytics.summary())
+        self.assertFalse(dashboard.paused)
+
     def test_quiet_hours_cross_midnight(self):
         prefs = {**WEB_DEFAULTS, "quiet_start": "22:00", "quiet_end": "07:00"}
         for hour, expected in ((23, True), (3, True), (12, False), (7, False)):
             self.assertEqual(quiet_now(prefs, datetime(2026, 10, 28, hour)), expected)
+
+    def test_break_completion_waits_for_resume_and_early_end_is_idempotent(self):
+        with patch('web_server.load_settings', return_value=preferences()):
+            dashboard = Dashboard(args())
+        dashboard.command({'action': 'start'})
+        dashboard.command({'action': 'take_break'})
+        dashboard.break_until = time.monotonic() - 1
+        state = dashboard.state()
+        self.assertEqual(state['break_seconds'], 0)
+        self.assertTrue(state['break_active'])
+        self.assertTrue(state['paused'])
+        dashboard.command({'action': 'end_break'})
+        self.assertFalse(dashboard.state()['break_active'])
+        self.assertFalse(dashboard.paused)
+        revision = dashboard.revision
+        dashboard.command({'action': 'end_break'})
+        self.assertEqual(dashboard.revision, revision)
+        self.assertFalse(dashboard.paused)
+        dashboard.command({'action': 'take_break'})
+        dashboard.command({'action': 'end_break'})
+        self.assertEqual(dashboard.state()['snooze_seconds'], 0)
+        dashboard.command({'action': 'take_break'})
+        dashboard.command({'action': 'snooze', 'minutes': 10})
+        dashboard.command({'action': 'end_break'})
+        self.assertGreater(dashboard.state()['snooze_seconds'], 500)
 
     def test_snapshot_never_reassures_with_missing_measurements(self):
         monitor = Monitor("front", 5)
@@ -138,10 +246,39 @@ class WebTests(unittest.TestCase):
             with dashboard.lock:
                 self.assertTrue(dashboard.frames.get('front', b'').startswith(b'\xff\xd8'))
                 self.assertIn('metrics', dashboard.cameras['front'])
+                self.assertIn('fatigue', dashboard.cameras['front'])
             dashboard.command({'action': 'pause'})
             time.sleep(.2)
             self.assertEqual(dashboard.frames, {})
             self.assertEqual(dashboard.cameras, {})
+        finally:
+            dashboard.stop.set()
+            for thread in dashboard.threads:
+                thread.join(timeout=3)
+
+    def test_dedicated_writing_demo_feed_and_recalibration(self):
+        with patch('web_server.load_settings', return_value=preferences()):
+            dashboard = Dashboard(args())
+        dashboard.settings['web'].update(writing_enabled=True, writing_source='2')
+        dashboard.launch()
+        try:
+            dashboard.command({'action': 'start'})
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                with dashboard.lock:
+                    if dashboard.frames.get('writing') and dashboard.writing:
+                        break
+                time.sleep(.05)
+            with dashboard.lock:
+                self.assertTrue(dashboard.frames.get('writing', b'').startswith(b'\xff\xd8'))
+                self.assertEqual(dashboard.writing['phase'], 'calibrating')
+                old_revision = dashboard.writing_revision
+            dashboard.command({'action': 'writing_calibrate'})
+            self.assertEqual(dashboard.writing_revision, old_revision + 1)
+            dashboard.command({'action': 'pause'})
+            time.sleep(.2)
+            self.assertEqual(dashboard.frames, {})
+            self.assertEqual(dashboard.writing, {})
         finally:
             dashboard.stop.set()
             for thread in dashboard.threads:
@@ -158,7 +295,7 @@ class WebTests(unittest.TestCase):
             connection.request('GET', '/')
             response = connection.getresponse()
             self.assertEqual(response.status, 200)
-            self.assertIn(b'Make room for comfort', response.read())
+            self.assertIn(b'Session analytics', response.read())
             connection.request('GET', '/api/state', headers={'Host': 'attacker.example'})
             response = connection.getresponse()
             self.assertEqual(response.status, 403)
@@ -172,6 +309,20 @@ class WebTests(unittest.TestCase):
             response = connection.getresponse()
             self.assertEqual(response.status, 200)
             self.assertTrue(json.loads(response.read())['started'])
+            connection.request('GET', '/manifest.webmanifest')
+            response = connection.getresponse()
+            self.assertEqual(json.loads(response.read())['display'], 'standalone')
+            connection.request('GET', '/api/analytics')
+            response = connection.getresponse()
+            self.assertIsNotNone(json.loads(response.read())['current'])
+            connection.request('GET', '/api/export.csv')
+            response = connection.getresponse()
+            self.assertIn('attachment', response.getheader('Content-Disposition'))
+            self.assertIn(b'near_reference_percent', response.read())
+            connection.request('GET', '/api/analytics?id=nonexistent')
+            response = connection.getresponse()
+            self.assertEqual(response.status, 404)
+            response.read()
             connection.request('GET', '/feed/front.jpg')
             response = connection.getresponse()
             self.assertEqual(response.status, 503)

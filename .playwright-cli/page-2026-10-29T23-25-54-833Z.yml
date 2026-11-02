@@ -1,0 +1,90 @@
+- generic "Live monitor" [active] [ref=f3e1]:
+  - banner:
+    - navigation "Main navigation" [ref=f3e2]:
+      - link "Live monitor" [ref=f3e3] [cursor=pointer]:
+        - /url: "#monitor"
+      - link "Dashboard" [ref=f3e4] [cursor=pointer]:
+        - /url: "#dashboard"
+    - link "Settings" [ref=f3e6] [cursor=pointer]:
+      - /url: "#settings"
+  - generic [ref=f3e7]:
+    - generic [ref=f3e8]: Live monitor
+    - main [ref=f3e9]:
+      - generic [ref=f3e11]:
+        - button "Pause" [ref=f3e12] [cursor=pointer]
+        - button "Recalibrate" [ref=f3e13] [cursor=pointer]
+        - button "End session" [ref=f3e14] [cursor=pointer]
+      - generic [ref=f3e15]: DEMO · Synthetic measurements and video. This does not test camera accuracy.
+      - generic [ref=f3e16]:
+        - generic [ref=f3e17]:
+          - generic "Active reminders" [ref=f3e18]:
+            - generic "Tiredness · Suggestion" [ref=f3e19]:
+              - generic [ref=f3e20]: Tiredness
+              - paragraph [ref=f3e21]: You may be tired. Take a 2-minute break and look away from the screen.
+              - button "Dismiss Tiredness reminder" [ref=f3e22] [cursor=pointer]: ×
+            - generic "Posture · Correction" [ref=f3e23]:
+              - generic [ref=f3e24]: Posture
+              - paragraph [ref=f3e25]: Sit comfortably upright and bring your work within reach.
+              - button "Dismiss Posture reminder" [ref=f3e26] [cursor=pointer]: ×
+            - generic "Eyes · Correction" [ref=f3e27]:
+              - generic [ref=f3e28]: Eyes
+              - paragraph [ref=f3e29]: Blink fully, then look away for a moment.
+              - button "Dismiss Eyes reminder" [ref=f3e30] [cursor=pointer]: ×
+          - region [ref=f3e31]:
+            - generic [ref=f3e32]:
+              - generic [ref=f3e33]:
+                - heading "Session average" [level=2] [ref=f3e34]
+                - paragraph [ref=f3e35]: 4m scored
+              - 'img "Session average alignment: 73 out of 100" [ref=f3e37]':
+                - strong [ref=f3e41]: "73"
+            - generic [ref=f3e42]:
+              - group [ref=f3e43]:
+                - 'generic "Posture Correction Posture: 42 out of 100 +" [ref=f3e44] [cursor=pointer]':
+                  - generic [ref=f3e45]:
+                    - text: Posture
+                    - generic [ref=f3e46]: Correction
+                  - 'img "Posture: 42 out of 100" [ref=f3e47]':
+                    - generic [ref=f3e51]: "42"
+                  - text: +
+              - group [ref=f3e52]:
+                - 'generic "Eyes Suggestion Eyes: 75 out of 100 +" [ref=f3e53] [cursor=pointer]':
+                  - generic [ref=f3e54]:
+                    - text: Eyes
+                    - generic [ref=f3e55]: Suggestion
+                  - 'img "Eyes: 75 out of 100" [ref=f3e56]':
+                    - generic [ref=f3e60]: "75"
+                  - text: +
+              - group [ref=f3e61]:
+                - 'generic "Grip & wrist Near reference Grip & wrist: 100 out of 100 +" [ref=f3e62] [cursor=pointer]':
+                  - generic [ref=f3e63]:
+                    - text: Grip & wrist
+                    - generic [ref=f3e64]: Near reference
+                  - 'img "Grip & wrist: 100 out of 100" [ref=f3e65]':
+                    - generic [ref=f3e69]: "100"
+                  - text: +
+            - group [ref=f3e70]:
+              - generic "How the score works" [ref=f3e71] [cursor=pointer]
+          - region [ref=f3e72]:
+            - heading "Break check" [level=3] [ref=f3e74]
+            - status [ref=f3e76]: You may be tired.
+            - button "Take a 2-min break" [ref=f3e77] [cursor=pointer]
+            - paragraph [ref=f3e78]: Pauses camera & reminders
+        - region "Live posture and writing monitor" [ref=f3e79]:
+          - generic [ref=f3e81]:
+            - generic [ref=f3e83]:
+              - generic [ref=f3e84]: ◉
+              - generic [ref=f3e85]: Camera off
+            - generic [ref=f3e86]:
+              - generic [ref=f3e87]: Adjustment suggested
+              - generic [ref=f3e88]: 15.1 FPS
+          - group [ref=f3e89]:
+            - generic "Measurements" [ref=f3e90] [cursor=pointer]
+            - option "Assessed photo" [selected]
+            - option "Live camera"
+            - option "Tripod" [selected]
+            - option "Quadrupod"
+            - option "Lateral tripod"
+            - option "Lateral quadrupod"
+            - option "Thumb wrap"
+            - option "Fisted"
+            - option "Other / adapted"

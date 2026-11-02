@@ -6,7 +6,7 @@ from pathlib import Path
 
 SETTINGS_PATH = Path(os.environ.get("POSTURE_MONITOR_SETTINGS", str(Path.home() / ".posture-eye-monitor.json")))
 DEFAULTS = {"camera": 0, "view": "auto", "alert_seconds": 5.0,
-            "notifications": True}
+            "notifications": False}
 
 
 def load_settings(path=SETTINGS_PATH):
@@ -29,7 +29,10 @@ def load_settings(path=SETTINGS_PATH):
         # Validate dashboard preferences before restoring them.
         from web_server import WEB_DEFAULTS, validate_preferences
         try:
-            settings = validate_preferences(saved["web"], {**settings, "web": WEB_DEFAULTS.copy()})
+            web = saved["web"].copy()
+            if web.get("writing_assessment") == "image":
+                web["writing_assessment"] = "geometry"
+            settings = validate_preferences(web, {**settings, "web": WEB_DEFAULTS.copy()})
         except ValueError:
             settings["web"] = WEB_DEFAULTS.copy()
     return settings

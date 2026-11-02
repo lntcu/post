@@ -1,0 +1,90 @@
+- generic "Live monitor" [active] [ref=f4e1]:
+  - banner:
+    - navigation "Main navigation" [ref=f4e2]:
+      - link "Live monitor" [ref=f4e3] [cursor=pointer]:
+        - /url: "#monitor"
+      - link "Dashboard" [ref=f4e4] [cursor=pointer]:
+        - /url: "#dashboard"
+    - link "Settings" [ref=f4e6] [cursor=pointer]:
+      - /url: "#settings"
+  - generic [ref=f4e7]:
+    - generic [ref=f4e8]: Live monitor
+    - main [ref=f4e9]:
+      - generic [ref=f4e11]:
+        - button "Pause" [ref=f4e12] [cursor=pointer]
+        - button "Recalibrate" [ref=f4e13] [cursor=pointer]
+        - button "End session" [ref=f4e14] [cursor=pointer]
+      - generic [ref=f4e15]: DEMO · Synthetic measurements and video. This does not test camera accuracy.
+      - generic [ref=f4e16]:
+        - generic [ref=f4e17]:
+          - generic "Active reminders" [ref=f4e18]:
+            - generic "Tiredness · Suggestion" [ref=f4e19]:
+              - generic [ref=f4e20]: Tiredness
+              - paragraph [ref=f4e21]: You may be tired. Take a 2-minute break and look away from the screen.
+              - button "Dismiss Tiredness reminder" [ref=f4e22] [cursor=pointer]: ×
+            - generic "Eyes · Correction" [ref=f4e23]:
+              - generic [ref=f4e24]: Eyes
+              - paragraph [ref=f4e25]: Blink fully, then look away for a moment.
+              - button "Dismiss Eyes reminder" [ref=f4e26] [cursor=pointer]: ×
+            - generic "Grip & wrist · Correction" [ref=f4e27]:
+              - generic [ref=f4e28]: Grip & wrist
+              - paragraph [ref=f4e29]: Reset your pen grip; keep it light and comfortable.
+              - button "Dismiss Grip & wrist reminder" [ref=f4e30] [cursor=pointer]: ×
+          - region [ref=f4e31]:
+            - generic [ref=f4e32]:
+              - generic [ref=f4e33]:
+                - heading "Session average" [level=2] [ref=f4e34]
+                - paragraph [ref=f4e35]: 4m scored
+              - 'img "Session average alignment: 73 out of 100" [ref=f4e37]':
+                - strong [ref=f4e41]: "73"
+            - generic [ref=f4e42]:
+              - group [ref=f4e43]:
+                - 'generic "Posture Near reference Posture: 100 out of 100 +" [ref=f4e44] [cursor=pointer]':
+                  - generic [ref=f4e45]:
+                    - text: Posture
+                    - generic [ref=f4e46]: Near reference
+                  - 'img "Posture: 100 out of 100" [ref=f4e47]':
+                    - generic [ref=f4e51]: "100"
+                  - text: +
+              - group [ref=f4e52]:
+                - 'generic "Eyes Suggestion Eyes: 50 out of 100 +" [ref=f4e53] [cursor=pointer]':
+                  - generic [ref=f4e54]:
+                    - text: Eyes
+                    - generic [ref=f4e55]: Suggestion
+                  - 'img "Eyes: 50 out of 100" [ref=f4e56]':
+                    - generic [ref=f4e60]: "50"
+                  - text: +
+              - group [ref=f4e61]:
+                - 'generic "Grip & wrist Correction Grip & wrist: 82 out of 100 +" [ref=f4e62] [cursor=pointer]':
+                  - generic [ref=f4e63]:
+                    - text: Grip & wrist
+                    - generic [ref=f4e64]: Correction
+                  - 'img "Grip & wrist: 82 out of 100" [ref=f4e65]':
+                    - generic [ref=f4e69]: "82"
+                  - text: +
+            - group [ref=f4e70]:
+              - generic "How the score works" [ref=f4e71] [cursor=pointer]
+          - region [ref=f4e72]:
+            - heading "Break check" [level=3] [ref=f4e74]
+            - status [ref=f4e76]: You may be tired.
+            - button "Take a 2-min break" [ref=f4e77] [cursor=pointer]
+            - paragraph [ref=f4e78]: Pauses camera & reminders
+        - region "Live posture and writing monitor" [ref=f4e79]:
+          - generic [ref=f4e81]:
+            - generic [ref=f4e83]:
+              - generic [ref=f4e84]: ◉
+              - generic [ref=f4e85]: Camera off
+            - generic [ref=f4e86]:
+              - generic [ref=f4e87]: Near your reference
+              - generic [ref=f4e88]: 14.3 FPS
+          - group [ref=f4e89]:
+            - generic "Measurements" [ref=f4e90] [cursor=pointer]
+            - option "Assessed photo" [selected]
+            - option "Live camera"
+            - option "Tripod" [selected]
+            - option "Quadrupod"
+            - option "Lateral tripod"
+            - option "Lateral quadrupod"
+            - option "Thumb wrap"
+            - option "Fisted"
+            - option "Other / adapted"

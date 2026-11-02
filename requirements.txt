@@ -3,4 +3,5 @@ numpy>=1.26,<2
 opencv-contrib-python>=4.8,<4.12
 jax==0.4.35
 jaxlib==0.4.35
+pillow>=10,<12
 windows-curses>=2.4; platform_system == "Windows"

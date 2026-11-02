@@ -7,18 +7,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import json
 import math
+import os
 import secrets
 import threading
 import time
 import webbrowser
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-from settings import load_settings, save_settings
+from settings import SETTINGS_PATH, load_settings, save_settings
+from analytics import Analytics
 
 WEB_DEFAULTS = {
-    "posture_alerts": True, "eye_alerts": True, "break_alerts": True,
+    "posture_alerts": True, "eye_alerts": True, "break_alerts": True, "fatigue_alerts": True,
     "sensitivity": "balanced", "break_minutes": 20, "cooldown_seconds": 60,
     "quiet_start": "", "quiet_end": "", "side_source": "",
+    "spoken_alerts": False, "speech_rate": 1.0, "speech_volume": .8, "speech_voice": "",
+    "history_enabled": True, "writing_enabled": False, "writing_alerts": True,
+    "writing_source": "", "writing_hand": "right", "writing_pen_markers": True, "writing_assessment": "geometry", "calibration_seconds": 4,
 }
 
 
@@ -28,12 +33,13 @@ def validate_preferences(payload, current):
         raise ValueError("Settings must be an object.")
     result = {**current, "web": {**WEB_DEFAULTS, **current.get("web", {})}}
     for key, value in payload.items():
-        if key in ("notifications", "posture_alerts", "eye_alerts", "break_alerts"):
+        if key in ("notifications", "posture_alerts", "eye_alerts", "break_alerts", "fatigue_alerts", "spoken_alerts", "history_enabled", "writing_enabled", "writing_alerts", "writing_pen_markers"):
             if type(value) is not bool:
                 raise ValueError(f"{key} must be on or off.")
-        elif key in ("camera", "alert_seconds", "break_minutes", "cooldown_seconds"):
+        elif key in ("camera", "alert_seconds", "break_minutes", "cooldown_seconds", "speech_rate", "speech_volume", "calibration_seconds"):
             limits = {"camera": (0, 20), "alert_seconds": (1, 120),
-                      "break_minutes": (1, 120), "cooldown_seconds": (10, 3600)}
+                      "break_minutes": (1, 120), "cooldown_seconds": (10, 3600),
+                      "speech_rate": (.5, 2), "speech_volume": (0, 1), "calibration_seconds": (2, 30)}
             low, high = limits[key]
             if type(value) not in (float, int) or not math.isfinite(value) or not low <= value <= high:
                 raise ValueError(f"{key} must be between {low} and {high}.")
@@ -55,7 +61,16 @@ def validate_preferences(payload, current):
                         raise ValueError("Use HH:MM.")
                 except ValueError:
                     raise ValueError("Quiet hours must be HH:MM.") from None
-        elif key == "side_source":
+        elif key == "speech_voice":
+            if not isinstance(value, str) or len(value) > 200:
+                raise ValueError("Choose a supported voice.")
+        elif key == 'writing_assessment':
+            if value != 'geometry':
+                raise ValueError('Writing assessment uses live camera geometry.')
+        elif key == "writing_hand":
+            if value not in ("left", "right"):
+                raise ValueError("Choose the left or right writing hand.")
+        elif key in ("side_source", "writing_source"):
             if not isinstance(value, str) or len(value) > 2048:
                 raise ValueError("Enter a camera index or direct stream URL.")
             if value:
@@ -75,6 +90,9 @@ def validate_preferences(payload, current):
     side = result["web"]["side_source"]
     if side.isdigit() and int(side) == result["camera"]:
         raise ValueError("Front and side cameras must be different.")
+    writing = result["web"]["writing_source"]
+    if writing and (writing == side or (writing.isdigit() and (int(writing) == result["camera"] or (side.isdigit() and int(writing) == int(side))))):
+        raise ValueError("Use an unused desk camera index/URL, or leave it empty to use the front camera.")
     if bool(result["web"]["quiet_start"]) != bool(result["web"]["quiet_end"]):
         raise ValueError("Set both quiet-hour times, or clear both.")
     return result
@@ -183,15 +201,31 @@ class Dashboard:
         self.active_notifications = set()
         self.token = secrets.token_urlsafe(32)
         self.threads = []
+        self.writing = {}
+        self.writing_revision = 0
+        from writing_validation import WritingRecorder, ChangeModel
+        self.writing_recorder = WritingRecorder()
+        self.pressure_readings = {}
+        self.writing_model = None
+        self.writing_model_error = ''
+        model_path = os.environ.get('POSTURE_WRITING_MODEL')
+        if model_path:
+            try:
+                self.writing_model = ChangeModel(json.loads(Path(model_path).read_text()))
+            except (OSError, ValueError, TypeError, KeyError):
+                self.writing_model_error = 'Writing change model could not be loaded. Check the model file.'
+        self.analytics = Analytics(SETTINGS_PATH.with_name(".posture-eye-analytics.sqlite3"), demo=args.demo)
+        self.break_until = 0.
 
     def launch(self):
         for name in ("front", "side"):
             thread = threading.Thread(target=self.worker, args=(name,), daemon=True)
             thread.start()
             self.threads.append(thread)
-        thread = threading.Thread(target=self.notify_worker, daemon=True)
-        thread.start()
-        self.threads.append(thread)
+        for target in (self.notify_worker, self.telemetry_worker, self.writing_worker):
+            thread = threading.Thread(target=target, daemon=True)
+            thread.start()
+            self.threads.append(thread)
 
     def state(self):
         with self.lock:
@@ -201,18 +235,62 @@ class Dashboard:
             for name, camera in cameras.items():
                 if camera.get("updated_at") is not None and time.monotonic() - camera["updated_at"] > 5:
                     cameras[name] = {"error": "Camera feed is delayed. Waiting for fresh measurements…", "confidence": "Unavailable"}
+            writing = json.loads(json.dumps(self.writing))
+            if writing.get("updated_at") is not None and time.monotonic() - writing["updated_at"] > 5:
+                writing = {"phase": "positioning", "confidence": "Unavailable", "status": "Writing feed delayed", "metrics": [], "guidance": [], "warning": False}
+            writing['assessment_mode'] = 'geometry'
+            from coaching import build_coaching, writing_posture_guidance
+            if self.settings["web"]["writing_enabled"]:
+                writing_posture_guidance(cameras)
+            coaching = build_coaching(cameras, writing, self.settings['web']['writing_enabled'],
+                                      self.started and not self.paused, bool(self.settings['web']['side_source']))
+            notifications = []
+            def add_notification(text, category, severity='warning', score=None):
+                notifications.append({'message': text, 'category': category, 'severity': severity, 'score': score})
             alerts = []
             if self.started and not self.paused and not quiet and not snooze:
                 for name, camera in cameras.items():
+                    fatigue = camera.get("fatigue", {})
+                    if name == "front" and fatigue.get("warning") and self.settings["web"]["fatigue_alerts"]:
+                        alerts.append(fatigue["guidance"])
+                        add_notification(fatigue["guidance"], 'Tiredness', 'suggestion')
                     if camera.get("warning") and self.settings["web"]["posture_alerts"]:
-                        alerts.extend(f"{name.title()}: {cue}" for cue in camera["guidance"])
+                        for cue in camera['guidance']:
+                            text = f"{name.title()}: {cue}"
+                            alerts.append(text)
+                            part = next((p for p in coaching['parts'] if p['label'] == ('Side posture' if name == 'side' else 'Posture')), {'severity': 'warning'})
+                            add_notification(text, 'Posture', part['severity'] if part['severity'] in ('warning', 'attention') else 'warning', part.get('score'))
                     if name == "front" and camera.get("eye_warning") and self.settings["web"]["eye_alerts"]:
-                        alerts.extend(camera["eye"]["guidance"])
+                        alerts.extend(camera['eye']['guidance'])
+                        for cue in camera['eye']['guidance']:
+                            add_notification(cue, 'Eyes')
                     if name == "front" and camera.get("break_warning") and self.settings["web"]["break_alerts"]:
                         alerts.append("Change position or take a short break.")
+                        add_notification(alerts[-1], 'Movement', 'suggestion')
+                if writing.get("warning") and self.settings["web"]["writing_enabled"] and self.settings["web"]["writing_alerts"]:
+                    issues = [row for row in writing.get('metrics', []) if row.get('issue')]
+                    priority = {'wrist': 0, 'fingers': 1, 'pen': 2, 'pressure': 3}
+                    issue = min(issues, key=lambda row: priority.get(row.get('family'), 4), default=None)
+                    cue = {'wrist': 'Turn the paper and support your forearm.',
+                           'fingers': 'Relax your fingers and try a lighter grip.',
+                           'pen': 'Check your pen position and try a few relaxed strokes.',
+                           'pressure': 'Ease your grip and check the sensor.'}.get(issue.get('family') if issue else None)
+                    if cue:
+                        alerts.append(cue)
+                    part = coaching['parts'][-1]
+                    if cue:
+                        add_notification(cue, 'Grip & wrist', part['severity'] if part['severity'] in ('warning', 'attention') else 'warning', part.get('score'))
             return {"started": self.started, "paused": self.paused, "cameras": cameras,
-                    "settings": self.settings, "alerts": alerts, "quiet": quiet,
+                    "settings": self.settings, "alerts": alerts, "notifications": notifications, "coaching": coaching, "quiet": quiet,
                     "snooze_seconds": snooze, "demo": self.args.demo,
+                    "writing": writing, "writing_recording": self.writing_recorder.status(),
+                    "writing_model_error": self.writing_model_error,
+                    "pressure": {kind: {'device': r['device'], 'newtons': r['newtons'],
+                                          'fresh': time.monotonic() - r['time'] <= .5}
+                                 for kind, r in self.pressure_readings.items()},
+                    "session": self.analytics.summary(), "history_error": self.analytics.error,
+                    "break_seconds": math.ceil(max(0, self.break_until - time.monotonic())),
+                    "break_active": bool(self.started and self.paused and self.break_until),
                     "desktop_notifications_supported": __import__('sys').platform == "darwin"}
 
     def command(self, payload):
@@ -222,23 +300,93 @@ class Dashboard:
                 updated = validate_preferences(payload.get("settings"), self.settings)
                 save_settings(updated)
                 # Alert-only changes do not require a fresh camera calibration.
-                if any(updated[k] != self.settings[k] for k in ("camera", "view")) or updated["web"]["side_source"] != self.settings["web"]["side_source"]:
+                if any(updated[k] != self.settings[k] for k in ("camera", "view")) or any(updated["web"][key] != self.settings["web"][key] for key in ("side_source", "writing_enabled", "writing_source", "writing_hand", "writing_pen_markers", "writing_assessment", "calibration_seconds")):
+                    self.analytics.suspend()
                     self.revision += 1
                     self.cameras.clear()
                     self.frames.clear()
+                    self.writing.clear()
+                self.analytics.set_persistence(updated["web"]["history_enabled"])
                 self.settings = updated
+            elif action == 'writing_record_start':
+                if not self.started or self.paused or not self.settings['web']['writing_enabled']:
+                    raise ValueError('Start hand tracking before recording.')
+                self.writing_recorder.start(payload.get('participant'), payload.get('style', ''), time.monotonic())
+                self.writing_recorder.metadata['setup'] = {key: self.settings['web'][key]
+                    for key in ('writing_hand', 'writing_pen_markers')}
+                self.writing_recorder.metadata['demo'] = self.args.demo
+            elif action == 'writing_record_label':
+                self.writing_recorder.set_label(payload.get('label'))
+            elif action == 'writing_record_stop':
+                self.writing_recorder.active = False
+            elif action == 'writing_pressure':
+                kind, force, device = payload.get('kind'), payload.get('newtons'), payload.get('device')
+                if kind not in ('grip_force', 'tip_force'):
+                    raise ValueError('Specify grip_force or tip_force; tip force does not measure squeezing.')
+                if type(force) not in (int, float) or not math.isfinite(force) or not 0 <= force <= 1000:
+                    raise ValueError('Sensor force must be a finite value between 0 and 1000 newtons.')
+                if not isinstance(device, str) or not device.strip() or len(device) > 80:
+                    raise ValueError('Provide a sensor device identifier of 1–80 characters.')
+                previous = self.pressure_readings.get(kind)
+                if previous and previous['device'] != device:
+                    self.writing_revision += 1
+                    self.writing.clear()
+                self.pressure_readings[kind] = {'device': device, 'newtons': force, 'time': time.monotonic()}
             elif action == "start":
+                if self.snoozed_until == self.break_until:
+                    self.snoozed_until = 0
+                self.break_until = 0
+                if not self.started:
+                    self.analytics.start(self.settings["web"]["history_enabled"])
                 self.started = True
                 self.paused = False
                 self.revision += 1
             elif action == "pause":
+                self.analytics.suspend()
+                self.writing.clear()
                 self.paused = not self.paused
+                if not self.paused:
+                    if self.snoozed_until == self.break_until:
+                        self.snoozed_until = 0
+                    self.break_until = 0
                 self.revision += 1
                 self.cameras.clear()
                 self.frames.clear()
             elif action == "recalibrate":
+                self.analytics.suspend()
+                self.writing.clear()
                 self.revision += 1
                 self.cameras.clear()
+            elif action == "writing_calibrate":
+                self.writing_revision += 1
+                self.writing.clear()
+            elif action == "take_break":
+                if not self.started:
+                    raise ValueError("Start a session before taking a break.")
+                self.analytics.suspend()
+                self.break_until = time.monotonic() + 120
+                self.snoozed_until = self.break_until
+                if self.started and not self.paused:
+                    self.paused = True
+                    self.revision += 1
+                    self.cameras.clear()
+                    self.frames.clear()
+                    self.writing.clear()
+            elif action == "end_break":
+                # Idempotent: a repeated request must never pause a resumed session.
+                if self.started and self.paused and self.break_until:
+                    if self.snoozed_until == self.break_until:
+                        self.snoozed_until = 0
+                    self.break_until = 0
+                    self.paused = False
+                    self.revision += 1
+                    self.cameras.clear()
+                    self.frames.clear()
+                    self.writing.clear()
+            elif action == "clear_history":
+                if self.started:
+                    raise ValueError("Stop the current session before clearing history.")
+                self.analytics.clear()
             elif action == "snooze":
                 minutes = payload.get("minutes", 10)
                 if type(minutes) not in (int, float) or not math.isfinite(minutes) or not 1 <= minutes <= 120:
@@ -247,6 +395,12 @@ class Dashboard:
             elif action == "unsnooze":
                 self.snoozed_until = 0
             elif action == "stop":
+                self.paused = False
+                self.break_until = 0
+                self.analytics.finish()
+                self.writing_recorder.active = False
+                self.pressure_readings.clear()
+                self.writing.clear()
                 self.started = False
                 self.revision += 1
                 self.cameras.clear()
@@ -279,12 +433,153 @@ class Dashboard:
                     self.last_notifications[message] = now
             self.active_notifications = events
 
+    def telemetry_worker(self):
+        while not self.stop.wait(1):
+            self.analytics.record(self.state())
+
+    def publish_writing(self, data, revision, hand_revision, measured=None):
+        with self.lock:
+            if revision == self.revision and hand_revision == self.writing_revision and self.started and not self.paused:
+                if self.writing_model and data.get('phase') == 'monitoring':
+                    data['learned_change'] = {'probability': self.writing_model.predict(data.get('metrics', []), data.get('geometry_source')),
+                                              'validation': self.writing_model.report}
+                self.writing_recorder.record(measured, data, time.monotonic())
+                self.writing = {**data, "updated_at": time.monotonic()}
+
+    @staticmethod
+    def selected_hand_index(result, settings):
+        if not result or not result.multi_hand_landmarks or not result.multi_handedness:
+            return None
+        candidates = []
+        for index, (_, handedness) in enumerate(zip(result.multi_hand_landmarks, result.multi_handedness)):
+            classified = handedness.classification[0]
+            if classified.label.lower() == settings['web']['writing_hand'] and classified.score >= .75:
+                candidates.append((classified.score, index))
+        return max(candidates)[1] if candidates else None
+
+    @staticmethod
+    def selected_hand(result, settings):
+        index = Dashboard.selected_hand_index(result, settings)
+        return result.multi_hand_landmarks[index].landmark if index is not None else None
+
+    def current_pressure(self):
+        with self.lock:
+            return {kind: r['newtons'] for kind, r in self.pressure_readings.items()
+                    if 0 <= time.monotonic() - r['time'] <= .5}
+
+    def extract_hand(self, result, frame, pose, settings):
+        from writing_detector import measure_hand
+        from pen_detector import detect_pen
+        hand = self.selected_hand(result, settings)
+        world = None
+        if hand is not None:
+            worlds = getattr(result, 'multi_hand_world_landmarks', None)
+            index = self.selected_hand_index(result, settings)
+            if worlds and index is not None and index < len(worlds):
+                world = worlds[index].landmark
+        pen = detect_pen(frame, hand) if settings['web'].get('writing_pen_markers', True) else None
+        return measure_hand(hand, frame.shape[1], frame.shape[0], pose, world=world,
+                            pen=pen, pressure=self.current_pressure())
+
+    def writing_worker(self):
+        """Optional dedicated desk feed; front-camera mode reuses front inference."""
+        import cv2
+        from contextlib import ExitStack
+        from main import open_side_capture
+        from writing_detector import HandMeasurement, WritingMonitor
+        capture = None
+        identity = None
+        monitor = WritingMonitor()
+        stack = ExitStack()
+        hands = pose = None
+        retry_at = 0
+        try:
+            while not self.stop.is_set():
+                with self.lock:
+                    settings = {**self.settings, "web": dict(self.settings["web"])}
+                    revision, hand_revision = self.revision, self.writing_revision
+                    enabled = self.started and not self.paused and settings["web"]["writing_enabled"] and bool(settings["web"]["writing_source"])
+                if not enabled:
+                    if capture is not None:
+                        capture.release()
+                        capture = None
+                    identity = None
+                    self.stop.wait(.1)
+                    continue
+                source = settings["web"]["writing_source"]
+                if identity != (source, revision, hand_revision):
+                    if capture is not None:
+                        capture.release()
+                        capture = None
+                    identity = (source, revision, hand_revision)
+                    monitor.reset()
+                    demo_start = time.monotonic()
+                    retry_at = 0
+                now = time.monotonic()
+                if self.args.demo:
+                    import numpy as np
+                    frame = np.full((540, 960, 3), (43, 52, 42), dtype=np.uint8)
+                    cv2.putText(frame, "DEMO / WRITING HAND", (55, 68), cv2.FONT_HERSHEY_SIMPLEX, .6, (210, 230, 210), 2)
+                    measured = HandMeasurement(.25 + (.5 if (now - demo_start) % 25 > 12 else 0), .15, 8.)
+                else:
+                    if capture is None:
+                        if now < retry_at:
+                            self.stop.wait(.1)
+                            continue
+                        capture = open_side_capture(cv2, int(source) if source.isdigit() else source)
+                        if not capture.isOpened():
+                            capture.release()
+                            capture = None
+                            self.publish_writing({"phase": "positioning", "confidence": "Unavailable", "status": "Desk camera unavailable · retrying", "metrics": [], "guidance": [], "warning": False}, revision, hand_revision)
+                            retry_at = now + 3
+                            continue
+                    ok, frame = capture.read()
+                    if not ok:
+                        capture.release()
+                        capture = None
+                        monitor.reset()
+                        with self.lock:
+                            self.frames.pop("writing", None)
+                        self.publish_writing({"phase": "positioning", "confidence": "Unavailable", "status": "Desk camera disconnected · retrying", "metrics": [], "guidance": [], "warning": False}, revision, hand_revision)
+                        retry_at = now + 3
+                        continue
+                    if hands is None:
+                        import mediapipe as mp
+                        hands = stack.enter_context(mp.solutions.hands.Hands(max_num_hands=2, min_detection_confidence=.65, min_tracking_confidence=.65))
+                        pose = stack.enter_context(mp.solutions.pose.Pose(min_detection_confidence=.6, min_tracking_confidence=.6))
+                    frame = cv2.flip(frame, 1)
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pose_result = pose.process(rgb)
+                    body = pose_result.pose_landmarks.landmark if pose_result.pose_landmarks else None
+                    hand_result = hands.process(rgb)
+                    measured = self.extract_hand(hand_result, frame, body, settings)
+                monitor.calibration_seconds = settings["web"]["calibration_seconds"]
+                self.publish_writing(monitor.update(measured, time.monotonic(), settings["alert_seconds"]), revision, hand_revision, measured)
+                from tracking_overlay import draw_tracking, demo_landmarks
+                if self.args.demo:
+                    demo_pose, demo_hand = demo_landmarks(body=False)
+                    draw_tracking(frame, hand=demo_hand, simulated=True)
+                else:
+                    draw_tracking(frame, pose=body, hand=self.selected_hand(hand_result, settings))
+                ok, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                with self.lock:
+                    if ok and revision == self.revision and self.started and not self.paused:
+                        self.frames["writing"] = encoded.tobytes()
+                self.stop.wait(.08)
+        except Exception as exc:
+            self.publish_writing({"phase": "positioning", "confidence": "Unavailable", "status": f"Hand tracker stopped ({type(exc).__name__}). Restart the server.", "metrics": [], "guidance": [], "warning": False}, revision, hand_revision)
+        finally:
+            if capture is not None:
+                capture.release()
+            stack.close()
+
     def worker(self, name):
         import cv2
         from main import Monitor, demo_measurement, open_side_capture
         from posture_detector import Thresholds
         from debug_tui import landmark_visibility
         from eye_detector import measure_eyes
+        from fatigue_detector import FatigueMonitor
         from contextlib import ExitStack
         capture = None
         identity = None
@@ -292,7 +587,11 @@ class Dashboard:
         previous = None
         retry_at = 0
         stack = ExitStack()
-        pose = face = None
+        pose = face = hands = None
+        from writing_detector import WritingMonitor
+        writing_monitor = WritingMonitor()
+        fatigue_monitor = FatigueMonitor()
+        hand_revision = None
         demo_start = time.monotonic()
         try:
             while not self.stop.is_set():
@@ -315,7 +614,8 @@ class Dashboard:
                     if capture is not None:
                         capture.release()
                         capture = None
-                    monitor = Monitor(new_identity[1], settings["alert_seconds"])
+                    monitor = Monitor(new_identity[1], settings["alert_seconds"], settings["web"]["calibration_seconds"])
+                    fatigue_monitor.reset()
                     identity = new_identity
                     demo_start = time.monotonic()
                     previous = None
@@ -324,18 +624,24 @@ class Dashboard:
                         pose.reset()
                     if face:
                         face.reset()
+                if hand_revision != (revision, self.writing_revision):
+                    writing_monitor.reset()
+                    hand_revision = (revision, self.writing_revision)
                 now = time.monotonic()
                 monitor.alert.delay_seconds = settings["alert_seconds"]
+                monitor.calibration_seconds = settings["web"]["calibration_seconds"]
+                writing_monitor.calibration_seconds = settings["web"]["calibration_seconds"]
                 monitor.activity.reminder_seconds = settings["web"]["break_minutes"] * 60
                 scale = {"gentle": 1.35, "balanced": 1, "sensitive": .75}[settings["web"]["sensitivity"]]
                 monitor.detector.thresholds = Thresholds(**{
                     key: (1 + (value - 1) * scale if key == "face_scale_ratio" else value * scale)
                     for key, value in asdict(Thresholds()).items()})
+                hand_points = None
                 if self.args.demo:
                     import numpy as np
                     frame = np.full((540, 960, 3), (43, 52, 42), dtype=np.uint8)
-                    cv2.putText(frame, "DEMO / SYNTHETIC FEED", (55, 225), cv2.FONT_HERSHEY_SIMPLEX, 1, (210, 230, 210), 2)
-                    cv2.putText(frame, "No camera is being used", (55, 275), cv2.FONT_HERSHEY_SIMPLEX, .7, (180, 200, 180), 1)
+                    cv2.putText(frame, "DEMO / SYNTHETIC FEED", (55, 68), cv2.FONT_HERSHEY_SIMPLEX, .6, (210, 230, 210), 2)
+                    cv2.putText(frame, "No camera is being used", (55, 92), cv2.FONT_HERSHEY_SIMPLEX, .5, (180, 200, 180), 1)
                     measured = demo_measurement(now - demo_start, monitor.detector.view)
                     eyes = .12 if 8 <= (now - demo_start) % 19 < 10 else .29
                     visibility = {}
@@ -380,8 +686,22 @@ class Dashboard:
                 now = time.monotonic()
                 fps = 1 / (now - previous) if previous and now > previous else 0
                 previous = now
+                if name == "front" and settings["web"]["writing_enabled"] and not settings["web"]["writing_source"]:
+                    if self.args.demo:
+                        from writing_detector import HandMeasurement
+                        hand_measurement = HandMeasurement(.25 + (.5 if (now - demo_start) % 25 > 12 else 0), .15, 8.)
+                    else:
+                        if hands is None:
+                            import mediapipe as mp
+                            hands = stack.enter_context(mp.solutions.hands.Hands(max_num_hands=2, min_detection_confidence=.65, min_tracking_confidence=.65))
+                        hand_result = hands.process(rgb)
+                        hand_points = self.selected_hand(hand_result, settings)
+                        hand_measurement = self.extract_hand(hand_result, frame, landmarks, settings)
+                    self.publish_writing(writing_monitor.update(hand_measurement, now, settings["alert_seconds"]), revision, hand_revision[1], hand_measurement)
                 snap = monitor.update(measured, now, fps, visibility, name, eyes)
                 data = describe_snapshot(snap, monitor.detector)
+                if name == "front":
+                    data["fatigue"] = asdict(fatigue_monitor.update(snap.eye, now))
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 data["lighting"] = "Too dark" if gray.mean() < 45 else "Very bright" if gray.mean() > 230 else "Usable"
                 if not self.args.demo and data["lighting"] != "Usable":
@@ -394,6 +714,13 @@ class Dashboard:
                         data["eye"]["confidence"] = "Limited"
                     if data["phase"] != "monitoring":
                         data["calibration_hint"] = lighting_hint + " " + data["calibration_hint"]
+                from tracking_overlay import draw_tracking, demo_landmarks
+                if self.args.demo:
+                    demo_pose, demo_hand = demo_landmarks(body=measured is not None,
+                        hand=name == 'front' and settings['web']['writing_enabled'] and not settings['web']['writing_source'])
+                    data['overlay'] = draw_tracking(frame, pose=demo_pose, hand=demo_hand, simulated=True)
+                else:
+                    data['overlay'] = draw_tracking(frame, pose=landmarks, face=face_landmarks, hand=hand_points)
                 data["updated_at"] = now
                 ok, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
                 with self.lock:
@@ -430,6 +757,10 @@ def make_handler(dashboard):
                 data = json.dumps(data).encode()
             self.send_response(code)
             self.send_header("Content-Type", content_type)
+            if content_type == 'application/x-ndjson':
+                self.send_header('Content-Disposition', 'attachment; filename="writing-recording.jsonl"')
+            if content_type.startswith("text/csv"):
+                self.send_header("Content-Disposition", 'attachment; filename="still-sessions.csv"')
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
@@ -450,6 +781,18 @@ def make_handler(dashboard):
             path = urlparse(self.path).path
             if path == "/api/state":
                 return self.reply(200, dashboard.state())
+            if path == "/api/analytics":
+                identifier = parse_qs(urlparse(self.path).query).get("id", [None])[0]
+                if identifier is not None:
+                    detail = dashboard.analytics.detail(identifier)
+                    return self.reply(200, {"session": detail}) if detail else self.reply(404, {"error": "Session not found."})
+                return self.reply(200, {"current": dashboard.analytics.summary(), "history": dashboard.analytics.history(), "error": dashboard.analytics.error})
+            if path == '/api/writing-recording.jsonl':
+                with dashboard.lock:
+                    content = dashboard.writing_recorder.export()
+                return self.reply(200, content.encode(), 'application/x-ndjson')
+            if path == "/api/export.csv":
+                return self.reply(200, dashboard.analytics.export_csv(), "text/csv; charset=utf-8")
             if path == "/api/session":
                 return self.reply(200, {"token": dashboard.token})
             if path.startswith("/feed/"):
@@ -458,7 +801,10 @@ def make_handler(dashboard):
                     frame = dashboard.frames.get(name)
                 return self.reply(200, frame, "image/jpeg") if frame else self.reply(503, {"error": "Waiting for camera"})
             assets = {"/": ("index.html", "text/html; charset=utf-8"),
-                      "/app.js": ("app.js", "application/javascript"), "/style.css": ("style.css", "text/css")}
+                      "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+                      "/sw.js": ("sw.js", "application/javascript"), "/icon.svg": ("icon.svg", "image/svg+xml"),
+                      "/app.js": ("app.js", "application/javascript"), "/i18n.js": ("i18n.js", "application/javascript"),
+                      "/style.css": ("style.css", "text/css")}
             if path in assets:
                 filename, mime = assets[path]
                 return self.reply(200, (Path(__file__).parent / "web" / filename).read_bytes(), mime)
@@ -467,7 +813,8 @@ def make_handler(dashboard):
         def do_POST(self):
             if not self.allowed() or self.headers.get("X-Dashboard-Token") != dashboard.token:
                 return self.reply(403, {"error": "Reload the dashboard to reconnect."})
-            if urlparse(self.path).path != "/api/command":
+            path = urlparse(self.path).path
+            if path != '/api/command':
                 return self.reply(404, {"error": "Not found"})
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -482,20 +829,44 @@ def make_handler(dashboard):
     return Handler
 
 
+def open_app_window(url):
+    """Use an installed browser's app window; never installs another runtime."""
+    import os
+    import shutil
+    import subprocess
+    candidates = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        str(Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Google/Chrome/Application/chrome.exe"),
+        str(Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Microsoft/Edge/Application/msedge.exe"),
+    ]
+    candidates.extend(filter(None, (shutil.which(name) for name in ("google-chrome", "chromium", "chromium-browser", "microsoft-edge"))))
+    for candidate in candidates:
+        if Path(candidate).is_file():
+            try:
+                subprocess.Popen([candidate, f"--app={url}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except OSError:
+                continue
+    return False
+
+
 def run_web(args):
     dashboard = Dashboard(args)
     server = Server(("127.0.0.1", args.port), make_handler(dashboard))
     dashboard.launch()
     url = f"http://127.0.0.1:{server.server_port}"
-    print(f"Posture Monitor: {url}\nOpen the dashboard and choose Start setup. Press Ctrl+C here to stop.", flush=True)
+    print(f"Posture Monitor: {url}\nOpen Still and choose Start session. Press Ctrl+C here to stop.", flush=True)
     if not args.no_browser:
-        webbrowser.open(url)
+        if not getattr(args, "app", False) or not open_app_window(url):
+            webbrowser.open(url)
     try:
         server.serve_forever(poll_interval=.25)
     except KeyboardInterrupt:
         pass
     finally:
         dashboard.stop.set()
+        dashboard.analytics.finish()
         server.server_close()
         for thread in dashboard.threads:
             thread.join(timeout=4)

@@ -1,0 +1,86 @@
+- generic "Live monitor" [active] [ref=f2e1]:
+  - banner:
+    - navigation "Main navigation" [ref=f2e2]:
+      - link "Live monitor" [ref=f2e3] [cursor=pointer]:
+        - /url: "#monitor"
+      - link "Dashboard" [ref=f2e4] [cursor=pointer]:
+        - /url: "#dashboard"
+    - link "Settings" [ref=f2e6] [cursor=pointer]:
+      - /url: "#settings"
+  - generic [ref=f2e7]:
+    - generic [ref=f2e8]: Live monitor
+    - main [ref=f2e9]:
+      - generic [ref=f2e11]:
+        - button "Pause" [ref=f2e12] [cursor=pointer]
+        - button "Recalibrate" [ref=f2e13] [cursor=pointer]
+        - button "End session" [ref=f2e14] [cursor=pointer]
+      - generic [ref=f2e15]: DEMO · Synthetic measurements and video. This does not test camera accuracy.
+      - generic [ref=f2e16]:
+        - generic [ref=f2e17]:
+          - generic "Active reminders" [ref=f2e18]:
+            - generic "Tiredness · Suggestion" [ref=f2e19]:
+              - generic [ref=f2e20]: Tiredness
+              - paragraph [ref=f2e21]: You may be tired. Take a 2-minute break and look away from the screen.
+              - button "Dismiss Tiredness reminder" [ref=f2e22] [cursor=pointer]: ×
+            - generic "Eyes · Correction" [ref=f2e23]:
+              - generic [ref=f2e24]: Eyes
+              - paragraph [ref=f2e25]: Blink fully, then look away for a moment.
+              - button "Dismiss Eyes reminder" [ref=f2e26] [cursor=pointer]: ×
+          - region [ref=f2e27]:
+            - generic [ref=f2e28]:
+              - generic [ref=f2e29]:
+                - heading "Session average" [level=2] [ref=f2e30]
+                - paragraph [ref=f2e31]: 3m scored
+              - 'img "Session average alignment: 73 out of 100" [ref=f2e33]':
+                - strong [ref=f2e37]: "73"
+            - generic [ref=f2e38]:
+              - group [ref=f2e39]:
+                - 'generic "Posture Not assessed Posture: Not assessed +" [ref=f2e40] [cursor=pointer]':
+                  - generic [ref=f2e41]:
+                    - text: Posture
+                    - generic [ref=f2e42]: Not assessed
+                  - 'img "Posture: Not assessed" [ref=f2e43]':
+                    - generic [ref=f2e47]: —
+                  - text: +
+              - group [ref=f2e48]:
+                - 'generic "Eyes Suggestion Eyes: 50 out of 100 +" [ref=f2e49] [cursor=pointer]':
+                  - generic [ref=f2e50]:
+                    - text: Eyes
+                    - generic [ref=f2e51]: Suggestion
+                  - 'img "Eyes: 50 out of 100" [ref=f2e52]':
+                    - generic [ref=f2e56]: "50"
+                  - text: +
+              - group [ref=f2e57]:
+                - 'generic "Grip & wrist Suggestion Grip & wrist: 82 out of 100 +" [ref=f2e58] [cursor=pointer]':
+                  - generic [ref=f2e59]:
+                    - text: Grip & wrist
+                    - generic [ref=f2e60]: Suggestion
+                  - 'img "Grip & wrist: 82 out of 100" [ref=f2e61]':
+                    - generic [ref=f2e65]: "82"
+                  - text: +
+            - group [ref=f2e66]:
+              - generic "How the score works" [ref=f2e67] [cursor=pointer]
+          - region [ref=f2e68]:
+            - heading "Break check" [level=3] [ref=f2e70]
+            - status [ref=f2e72]: You may be tired.
+            - button "Take a 2-min break" [ref=f2e73] [cursor=pointer]
+            - paragraph [ref=f2e74]: Pauses camera & reminders
+        - region "Live posture and writing monitor" [ref=f2e75]:
+          - generic [ref=f2e77]:
+            - generic [ref=f2e79]:
+              - generic [ref=f2e80]: ◉
+              - generic [ref=f2e81]: Camera off
+            - generic [ref=f2e82]:
+              - generic [ref=f2e83]: Tracking unavailable
+              - generic [ref=f2e84]: 14.4 FPS
+          - group [ref=f2e85]:
+            - generic "Measurements" [ref=f2e86] [cursor=pointer]
+            - option "Assessed photo" [selected]
+            - option "Live camera"
+            - option "Tripod" [selected]
+            - option "Quadrupod"
+            - option "Lateral tripod"
+            - option "Lateral quadrupod"
+            - option "Thumb wrap"
+            - option "Fisted"
+            - option "Other / adapted"

@@ -1,0 +1,68 @@
+- generic [active] [ref=e1]:
+  - banner:
+    - navigation "Main navigation" [ref=e2]:
+      - link "Live monitor" [ref=e3] [cursor=pointer]:
+        - /url: "#monitor"
+      - link "Dashboard" [ref=e4] [cursor=pointer]:
+        - /url: "#dashboard"
+    - link "Settings" [ref=e6] [cursor=pointer]:
+      - /url: "#settings"
+  - generic [ref=e7]:
+    - generic [ref=e8]: Dashboard
+    - main [ref=e9]:
+      - generic [ref=e10]:
+        - heading "Your day, in perspective." [level=1] [ref=e12]
+        - generic [ref=e13]:
+          - button "Start session" [ref=e14] [cursor=pointer]
+          - button "Pause" [disabled] [ref=e15]
+          - button "Recalibrate" [disabled] [ref=e16]
+          - button "End session" [disabled] [ref=e17]
+      - region [ref=e19]:
+        - heading "Session analytics" [level=2] [ref=e20]
+        - generic [ref=e21]:
+          - generic [ref=e22]:
+            - button "This session" [ref=e23] [cursor=pointer]
+            - button "Last 7 days" [ref=e24] [cursor=pointer]
+            - button "Last 30 days" [ref=e25] [cursor=pointer]
+          - link "Export CSV ↗" [ref=e26] [cursor=pointer]:
+            - /url: /api/export.csv
+        - generic [ref=e27]:
+          - article [ref=e28]:
+            - paragraph [ref=e29]: ACTIVE TIME
+            - strong [ref=e30]: —
+          - article [ref=e31]:
+            - paragraph [ref=e32]: NEAR YOUR REFERENCE
+            - strong [ref=e33]: —
+          - article [ref=e34]:
+            - paragraph [ref=e35]: TRACKING COVERAGE
+            - strong [ref=e36]: —
+          - article [ref=e37]:
+            - paragraph [ref=e38]: MOVEMENT RESETS
+            - strong [ref=e39]: —
+        - generic [ref=e40]:
+          - generic [ref=e41]:
+            - generic [ref=e42]:
+              - heading "Posture over time" [level=2] [ref=e44]
+              - generic [ref=e45]: Near reference Changed Untracked
+            - generic [ref=e49]:
+              - img "Posture time chart. Detailed values are in the table below." [ref=e50]
+              - paragraph [ref=e51]: No session data
+            - group [ref=e52]:
+              - generic "View chart values" [ref=e53] [cursor=pointer]
+          - generic [ref=e54]:
+            - heading "Recurring changes" [level=2] [ref=e55]
+            - paragraph [ref=e57]: No data
+        - region [ref=e58]:
+          - heading "Eyes & writing" [level=2] [ref=e59]
+          - region "Eyes and writing metrics" [ref=e61]:
+            - generic [ref=e62]:
+              - generic [ref=e63]: Average estimated blink rate
+              - strong [ref=e64]: —
+            - generic [ref=e65]:
+              - generic [ref=e66]: Writing hand tracked
+              - strong [ref=e67]: —
+            - generic [ref=e68]:
+              - generic [ref=e69]: Writing cues changed
+              - strong [ref=e70]: —
+        - group [ref=e71]:
+          - generic "Session history" [ref=e72] [cursor=pointer]

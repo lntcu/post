@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     saved = load_settings()
     parser = argparse.ArgumentParser(description="Local webcam posture and eye monitor")
     parser.add_argument("--port", type=int, default=8765, help="Local web dashboard port")
+    parser.add_argument("--app", action="store_true", help="Open a dedicated Chrome/Edge app window when available")
     parser.add_argument("--no-browser", action="store_true", help="Do not open a browser automatically")
     parser.add_argument("--legacy-gui", action="store_true", help="Use the previous OpenCV controls")
     parser.add_argument("--camera", type=int, default=saved["camera"], help="OpenCV camera index")
@@ -65,7 +66,8 @@ def maybe_beep(enabled: bool) -> None:
 class Monitor:
     """Calibration and alert state shared by webcam and demo paths."""
 
-    def __init__(self, view: str, alert_seconds: float) -> None:
+    def __init__(self, view: str, alert_seconds: float, calibration_seconds: float = CALIBRATION_SECONDS) -> None:
+        self.calibration_seconds = calibration_seconds
         self.detector = PostureDetector(view=view)
         self.alert = AlertTimer(alert_seconds)
         self.eyes = EyeMonitor()
@@ -111,11 +113,11 @@ class Monitor:
                     self.calibration_start = now
                     self.calibration_view = measured.view
                 self.samples.append(measured)
-                if now - self.calibration_start >= CALIBRATION_SECONDS:
+                if now - self.calibration_start >= self.calibration_seconds:
                     self.detector.calibrate(self.samples)
                     self.samples.clear()
-            remaining = (max(0.0, CALIBRATION_SECONDS - (now - self.calibration_start))
-                         if self.calibration_start is not None else CALIBRATION_SECONDS)
+            remaining = (max(0.0, self.calibration_seconds - (now - self.calibration_start))
+                         if self.calibration_start is not None else self.calibration_seconds)
             return DebugSnapshot("calibrating" if not hint else "positioning",
                                  Assessment("Calibrating" if not hint else "Not Detected", None),
                                  measured, remaining,
